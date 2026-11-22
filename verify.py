@@ -186,6 +186,21 @@ def _child(root, sources, test_ids, timeouts, extra_files):
     signal.signal(signal.SIGALRM, on_alarm)
 
     failed = set()
+    # A changed module that no longer imports breaks every test that imports it, run here or not.
+    for rel in sources:
+        if rel.endswith('.py') and rel.startswith('sqlglot/'):
+            name = rel[:-3].replace('/', '.')
+            if name.endswith('.__init__'):
+                name = name[:-9]
+            try:
+                signal.alarm(60)
+                importlib.import_module(name)
+                signal.alarm(0)
+            except BaseException:
+                signal.alarm(0)
+                failed.add(('IMPORT', rel))
+    if failed:
+        return [list(item) for item in failed]
     by_module = {}
     for test_id in test_ids:
         path, cls, method = test_id.split('::')
@@ -284,8 +299,11 @@ def finish(pid, read_fd, deadline=None):
             break
         chunks.append(chunk)
     os.close(read_fd)
-    os.waitpid(pid, 0)
+    _, _, usage = os.wait4(pid, 0)
+    cpu = usage.ru_utime + usage.ru_stime
     try:
-        return json.loads(b''.join(chunks).decode())
+        result = json.loads(b''.join(chunks).decode())
     except ValueError:
-        return {'error': 'no result'}
+        result = {'error': 'no result'}
+    result['cpu'] = cpu
+    return result

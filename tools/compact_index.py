@@ -1,6 +1,6 @@
 """Compact raw per-test coverage (tools/build_coverage.py output) into the runtime index.
 
-usage: python tools/compact_index.py RAW.json OUT.json.gz [CPU.json]
+usage: python tools/compact_index.py RAW.json OUT.json.gz [CPU.json [CORE.json]]
 Everything here is derived from one run of the pinned commit's own test suite.
 """
 import gzip
@@ -12,6 +12,7 @@ from collections import defaultdict
 raw = json.load(open(sys.argv[1]))
 out = sys.argv[2]
 cpu = json.load(open(sys.argv[3])) if len(sys.argv) > 3 else None
+core = json.load(open(sys.argv[4])) if len(sys.argv) > 4 else None
 
 tests = list(dict.fromkeys(raw['order']))
 num = {t: i for i, t in enumerate(tests)}
@@ -71,6 +72,8 @@ index = {'commit': 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa', 'tests': tests, '
          'opens': {p: intern(v) for p, v in sorted(opens.items())},
          'listed': {p: intern(v) for p, v in sorted(listed.items())},
          'classes': classes}
+if core:
+    index['core_modules'] = core
 if cpu:
     # local CPU (ms) of each test run inline the way verify.py runs it; class fixtures and imports
     index['cpu_ms'] = {t: round(v * 1000, 1) for t, v in cpu['test_cpu'].items()}

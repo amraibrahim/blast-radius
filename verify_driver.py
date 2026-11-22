@@ -36,6 +36,7 @@ class Plan:
         self.run = []
         self.est_ms = 0.0
         self.saving = 0.0
+        self.probe = False
 
 
 def estimate(selector, index, numbers):
@@ -58,13 +59,21 @@ def estimate(selector, index, numbers):
 def failure_prior(reasons):
     """Chance that some candidate fails. A test that reads an edited data file (fixture) almost
     always fails; code edits split roughly evenly between breaking and not breaking."""
+    if any(r[0] == 'syntax-error' for r in reasons):
+        return 1.0
     if any(r[0] == 'data-file' and r[2] > 0 for r in reasons):
         return 0.9
     return P_FAIL
 
 
+IMPORT_TIME = {'module-names', 'module-stmt', 'module-gap', 'import-same-bindings', 'class-body',
+               'class-attr', 'class-unseen', 'def'}
+
+
 def plan_commit(selector, index, commit, candidates, sources, reasons=()):
     plan = Plan(commit, candidates, sources)
+    # Code that runs at import time changed: always check the module still imports.
+    plan.probe = any(r[0] in IMPORT_TIME and str(r[1]).startswith('sqlglot/') for r in reasons)
     p_fail = failure_prior(reasons)
     if not candidates or len(candidates) >= len(selector.all) * 0.5:
         return plan                      # nothing to run, or so broad that listing is cheaper
@@ -99,9 +108,14 @@ def decide(selector, plans):
     started = time.time()
     budget = min(WALL_CAP, WALL_PER_COMMIT * max(1, len(plans)))
     work = [plan_commit(selector, index, c, s, src, r) for c, s, r, src in plans]
-    queue = sorted((p for p in work if p.run), key=lambda p: -p.saving)
+    queue = sorted((p for p in work if p.run or p.probe), key=lambda p: -p.saving)
     if queue:
-        verify.preload()
+        # Heavy third-party imports are shared by forking only when several children need them.
+        heavy = {rel for rel, text in selector.all_sources().items() if rel.startswith('tests/') and
+                 any(f'import {m}' in text or f'from {m}' in text for m in ('pandas', 'duckdb', 'numpy'))}
+        needing = sum(1 for p in queue if any(selector.by_number[n]['file'] in heavy for n in p.run))
+        if needing >= 2:
+            verify.preload()
         sys.stdout.flush()
         sys.stderr.flush()
     running = {}
@@ -115,7 +129,7 @@ def decide(selector, plans):
         while pending and len(running) < PARALLEL:
             p = pending.pop(0)
             remaining = budget - (time.time() - started)
-            if p.est_ms / 1000 / CPU_FACTOR * 1.5 > remaining:
+            if p.run and p.est_ms / 1000 / CPU_FACTOR * 1.5 > remaining:
                 p.run = []          # out of budget: list the candidates instead
                 p.listed = set(p.candidates)
                 continue
@@ -155,7 +169,13 @@ def absorb(selector, plan, result):
     run = set(plan.run)
     failed = set()
     for item in result['failed']:
-        if isinstance(item, list):           # ['FILE', path] or ['ERR', ...]
+        if isinstance(item, list):           # ['FILE', path], ['IMPORT', module path] or ['ERR', ...]
+            if item[0] == 'IMPORT':
+                dependents = selector.import_dependents(item[1])
+                log(plan.commit, 'changed module fails to import', item[1])
+                plan.listed = set(selector.all) if dependents == 'everything' else \
+                    set(plan.listed) | set(plan.candidates) | dependents
+                return
             if item[0] == 'FILE':
                 failed |= {n for n in run if selector.by_number[n]['file'] == item[1]}
             else:
@@ -164,5 +184,5 @@ def absorb(selector, plan, result):
             failed.add(number_of[item])
         else:
             failed |= run                    # unrecognised report: be safe
-    log(plan.commit, f'ran {len(run)} failed {len(failed)}')
+    log(plan.commit, f'ran {len(run)} failed {len(failed)} est {plan.est_ms/CPU_FACTOR:.0f}ms local, actual {result.get("cpu", 0)*1000:.0f}ms, saving {plan.saving/1000:.2f}s')
     plan.listed = set(plan.listed) | failed

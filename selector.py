@@ -287,6 +287,19 @@ def qualname(chain, node=None):
     return '.'.join(parts)
 
 
+def import_bindings(tree):
+    """{(bound name, source module, source name, level)} for module-level imports."""
+    out = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out.add(((a.asname or a.name).split('.')[0], a.name, '', 0))
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                out.add((a.asname or a.name, node.module or '', a.name, node.level))
+    return out
+
+
 def bound_names(node):
     names = set()
     targets = []
@@ -336,6 +349,7 @@ class Selector:
         self._structure = {}
         self._file_cover = {}
         self._texts = None
+        self._changed_imports = {}
 
     # -- index access
     def tset(self, i):
@@ -423,11 +437,25 @@ class Selector:
                     out |= self.by_class.get(f'{rel}::{sub}', set())
         return out
 
-    def references(self, names, home_path):
-        """Coverage of every function in sqlglot/tests that references any of `names`."""
+    def importers_of(self, path):
+        """Source files that can name module `path`'s globals (the module itself and importers)."""
+        mod = self.module_name(path)
+        parent, _, short = mod.rpartition('.')
+        out = {path}
+        for rel, text in self.all_sources().items():
+            if mod in text or (parent and f'from {parent} import' in text and short in text):
+                out.add(rel)
+        return out
+
+    def references(self, names, home_path, module_scope=False):
+        """Coverage of every function that references any of `names` (module globals: only in
+        the defining module and modules importing it)."""
         out = set()
         found = False
+        allowed = self.importers_of(home_path) if module_scope else None
         for rel, text in self.all_sources().items():
+            if allowed is not None and rel not in allowed:
+                continue
             if not any(n in text for n in names):
                 continue
             try:
@@ -470,14 +498,15 @@ class Selector:
         try:
             new_tree = ast.parse(new)
         except SyntaxError:
-            # The module cannot be imported: every test file importing it errors at collection.
+            # The module cannot be imported: every test that imports it fails.
             reasons.append(('syntax-error', path))
-            return EVERYTHING
+            return self.import_dependents(path)
         selected = set(self.opens_for(path))
         if ast.dump(old_tree) == ast.dump(new_tree):
             reasons.append(('ast-identical', path, len(selected)))
             return selected
-        docstring_only = ast.dump(_strip_docstrings(old_tree)) == ast.dump(_strip_docstrings(ast.parse(new)))
+        self._changed_imports[path] = import_bindings(old_tree) ^ import_bindings(new_tree)
+        self._changed_imports[path] = {b[0] for b in self._changed_imports[path]}
         st = self.structure(path)
         new_st = self.structure(path, new)
         lines = sorted(deleted)
@@ -507,8 +536,6 @@ class Selector:
                 continue
             for start, end, node, chain in candidates:
                 selected |= self.region(path, st, start, end, node, chain, n, kind, is_test, reasons)
-        if docstring_only:
-            reasons.append(('docstring-only', path))
         return selected
 
     def opens_for(self, path):
@@ -583,7 +610,14 @@ class Selector:
             cover |= self.test_importers(path)
             reasons.append(('test-module', path, line, len(cover)))
             return cover
-        refs, found = self.references(names, path) if names else (set(), False)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # only names whose binding actually changed matter; an import that now fails is
+            # caught by the verifier's import probe
+            names = set(self._changed_imports.get(path, names))
+            if not names:
+                reasons.append(('import-same-bindings', path, line))
+                return set()
+        refs, found = self.references(names, path, module_scope=True) if names else (set(), False)
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom)) and found:
             reasons.append(('module-names', path, line, sorted(names)[:5], len(refs)))
             return refs
@@ -625,6 +659,25 @@ class Selector:
                 if not in_function or any(n in imported for n in span):
                     return None       # read while modules/classes are being built
                 out |= self.line_cover(rel, span)
+        return out
+
+    def import_dependents(self, path):
+        """Every test that would fail if module `path` could not be imported."""
+        mod = self.module_name(path)
+        core = self.index.get('core_modules')
+        if path.startswith('tests/') or core is None or mod in core:
+            if path.startswith('tests/') and path in self.by_file and not self.test_importers(path):
+                return set(self.by_file[path])
+            return EVERYTHING
+        out = set(self.file_cover(path))
+        for key, i in self.classes.items():
+            if key.split(':', 1)[0] == mod:
+                out |= self.tset(i)
+        out |= self.opens_for(path)
+        short = mod.rsplit('.', 1)[-1]
+        for rel, text in self.all_sources().items():
+            if rel.startswith('tests/') and (mod in text or f'import {short}' in text and mod.rsplit('.', 1)[0] in text):
+                out |= self.by_file.get(rel, set())
         return out
 
     def test_importers(self, path):
@@ -675,7 +728,15 @@ class Selector:
                 reasons.append(('deleted', path))
                 return EVERYTHING, reasons, {}
             try:
-                new, deleted, inserts, old_to_new, added = apply_hunks(old, d.hunks)
+                try:
+                    new, deleted, inserts, old_to_new, added = apply_hunks(old, d.hunks)
+                except ValueError:
+                    if '\r' in old:
+                        raise
+                    # a patch saved with CRLF line endings against an LF file
+                    hunks = [(st, [(tag, t[:-1] if t.endswith('\r') else t) for tag, t in body], nn)
+                             for st, body, nn in d.hunks]
+                    new, deleted, inserts, old_to_new, added = apply_hunks(old, hunks)
             except ValueError as exc:
                 reasons.append(('apply-failed', path, str(exc)))
                 return EVERYTHING, reasons, {}
@@ -689,7 +750,11 @@ class Selector:
                 selected |= got
             else:
                 hits = set(self.opens_for(path))
-                reasons.append(('data-file', path, len(hits)))
+                changed = [t for _, body, _ in d.hunks for tag, t in body if tag != ' ']
+                if path.endswith('.sql') and changed and all(t.strip().startswith('--') or not t.strip() for t in changed):
+                    reasons.append(('data-comment', path, len(hits)))   # loaders drop '--' lines
+                else:
+                    reasons.append(('data-file', path, len(hits)))
                 selected |= hits
         return selected, reasons, sources
 
