@@ -1275,6 +1275,10 @@ def main():
         log(commit, len(selected), reasons)
 
     results = decide(selector, plans)
+    # Experiments only (off by default): never list these test ids.
+    drop = {t['number'] for t in selector.tests if t['id'] in set(filter(None, os.environ.get('BR_DROP', '').split(',')))}
+    if drop:
+        results = [(commit, set(chosen) - drop) for commit, chosen in results]
     out = []
     for commit, chosen in results:
         workers, _ = schedule(chosen, selector.ms)
