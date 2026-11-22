@@ -7,26 +7,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# The exact environment the commits were labeled in, so tests run here behave as they did there.
+# The exact package set the commits were labeled with, so tests run here behave as they did there.
 COPY requirements.lock /app/requirements.lock
 RUN pip install -r /app/requirements.lock
 
-# sqlglot at the pinned commit (from sqlglot's own repository), byte-compiled so a read-only run
+# sqlglot at the pinned commit, from sqlglot's own repository, byte-compiled so the read-only run
 # never needs to write caches.
-ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-RUN python - <<'EOF'
-import io, os, shutil, tarfile, urllib.request
-commit = os.environ.get('SQLGLOT_COMMIT', 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa')
-url = f'https://github.com/tobymao/sqlglot/archive/{commit}.tar.gz'
-data = urllib.request.urlopen(url, timeout=120).read()
-with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-    tar.extractall('/opt', filter='data')
-shutil.move(f'/opt/sqlglot-{commit}', '/opt/sqlglot')
-EOF
-RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
-    && python -m compileall -q /usr/local/lib/python3.13 \
+COPY tools/fetch_sqlglot.py /app/fetch_sqlglot.py
+RUN python /app/fetch_sqlglot.py eb11aec4be8cb2122afe713a4816662c3f0fb2fa /opt/sqlglot \
+    && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
     && chmod -R a+rX /opt/sqlglot
 
+# Runtime: selector, verifier and the maps built from the pinned commit's own test run.
 COPY selector.py verify.py verify_driver.py index.json.gz /app/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 

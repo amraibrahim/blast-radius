@@ -174,7 +174,11 @@ def _child(root, sources, test_ids, timeouts, extra_files):
         real_gzip_open = gzip.open
         gzip.open = lambda file, *a, **k: real_gzip_open(_map(file), *a, **k)
 
-    sys.meta_path.insert(0, _Finder(root, sources))
+    finder = _Finder(root, sources)
+    stale = [m for m in finder.by_module if m in sys.modules]
+    if stale:
+        raise RuntimeError(f'patched modules already imported: {stale}')
+    sys.meta_path.insert(0, finder)
     import concurrent.futures as cf
     cf.ProcessPoolExecutor = _InlineExecutor
     import concurrent.futures.process as cfp

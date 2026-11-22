@@ -20,7 +20,9 @@ from selector import schedule, log
 # Scorer CPU per local CPU second. Calibrated from the pinned suite: recorded seconds (labeling
 # machine) / CPU measured here, median over tests > 50 ms. Override with BR_CPU_FACTOR.
 CPU_FACTOR = float(os.environ.get('BR_CPU_FACTOR', '2.2'))
-FORK_MS = 250.0          # scorer ms per verification child: fork, sqlglot import, patched compile
+CLEAN_CHILD_MS = 320.0   # local ms for a child that must import sqlglot itself (core module patched)
+WARM_CHILD_MS = 40.0     # local ms for a child forked from a parent with sqlglot imported
+MIN_SAVING_MS = 400.0    # expected saving required before running anything (model error margin)
 P_FAIL = 0.5             # prior that the run set contains a failing test
 PARALLEL = 2             # the run has 2 cores
 WALL_PER_COMMIT = 3.5    # seconds of wall budget per commit for verification
@@ -39,12 +41,18 @@ class Plan:
         self.probe = False
 
 
-def estimate(selector, index, numbers):
+def is_clean(selector, index, sources):
+    core = set(index.get('core_modules') or ())
+    return not core or any(rel.endswith('.py') and rel.startswith('sqlglot/') and
+                           selector.module_name(rel) in core for rel in sources)
+
+
+def estimate(selector, index, numbers, clean=True):
     """Scorer-ms to run `numbers` in one child."""
     cpu = index.get('cpu_ms', {})
     cls_cpu = index.get('class_cpu_ms', {})
     imp = index.get('import_cpu_ms', {})
-    total = FORK_MS / CPU_FACTOR
+    total = CLEAN_CHILD_MS if clean else WARM_CHILD_MS
     classes, files = set(), set()
     for n in numbers:
         t = selector.by_number[n]
@@ -75,6 +83,7 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
     # Code that runs at import time changed: always check the module still imports.
     plan.probe = any(r[0] in IMPORT_TIME and str(r[1]).startswith('sqlglot/') for r in reasons)
     p_fail = failure_prior(reasons)
+    clean = is_clean(selector, index, sources)
     if not candidates or len(candidates) >= len(selector.all) * 0.5:
         return plan                      # nothing to run, or so broad that listing is cheaper
     ms = selector.ms
@@ -90,12 +99,12 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
             break
         listed_cost = schedule(listed, ms)[1] if listed else 0.0
         extra = WORKER_MS_FAIL if not listed else 1000.0
-        cost = estimate(selector, index, run) + listed_cost + p_fail * extra
-        if cost < best[0]:
+        cost = estimate(selector, index, run, clean) + listed_cost + p_fail * extra
+        if cost < best[0] and cost + MIN_SAVING_MS < static:
             best = (cost, (set(listed), run))
     if best[1] is not None:
         plan.listed, plan.run = best[1]
-        plan.est_ms = estimate(selector, index, plan.run)
+        plan.est_ms = estimate(selector, index, plan.run, clean)
         plan.saving = static - best[0]
     return plan
 
@@ -124,10 +133,22 @@ def decide(selector, plans):
     for t in selector.tests:
         local = cpu.get(t['id'], t['seconds'] * 1000) / 1000
         timeouts[t['id']] = max(3.0, 8 * local)
-    pending = list(queue)
+    # Children for patches to modules that `import sqlglot` loads must start pristine; every other
+    # child can inherit an already-imported sqlglot, which saves the import in each child.
+    core = set(index.get('core_modules') or ())
+
+    def needs_clean(p):
+        return not core or any(rel.endswith('.py') and rel.startswith('sqlglot/') and
+                               selector.module_name(rel) in core for rel in p.sources)
+
+    pending = sorted(queue, key=lambda p: not needs_clean(p))
+    warmed = False
     while pending or running:
         while pending and len(running) < PARALLEL:
             p = pending.pop(0)
+            if not warmed and core and not needs_clean(p):
+                warm(selector.root)
+                warmed = True
             remaining = budget - (time.time() - started)
             if p.run and p.est_ms / 1000 / CPU_FACTOR * 1.5 > remaining:
                 p.run = []          # out of budget: list the candidates instead
@@ -158,6 +179,19 @@ def decide(selector, plans):
                 p.listed = set(p.candidates)
                 p.run = []
     return [(p.commit, p.listed) for p in work]
+
+
+def warm(root):
+    """Import pristine sqlglot core in the parent so later children inherit it."""
+    try:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        os.environ['SKIP_INTEGRATION'] = '0'
+        sys.dont_write_bytecode = True
+        import sqlglot  # noqa: F401
+        import tests.helpers  # noqa: F401
+    except BaseException as exc:  # a child imports on its own anyway
+        log('warm import failed', repr(exc))
 
 
 def absorb(selector, plan, result):
