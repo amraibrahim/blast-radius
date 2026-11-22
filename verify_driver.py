@@ -20,9 +20,9 @@ from selector import schedule, log
 # Scorer CPU per local CPU second. Calibrated from the pinned suite: recorded seconds (labeling
 # machine) / CPU measured here, median over tests > 50 ms. Override with BR_CPU_FACTOR.
 CPU_FACTOR = float(os.environ.get('BR_CPU_FACTOR', '2.2'))
-CLEAN_CHILD_MS = 320.0   # local ms for a child that must import sqlglot itself (core module patched)
-WARM_CHILD_MS = 40.0     # local ms for a child forked from a parent with sqlglot imported
-MIN_SAVING_MS = 400.0    # expected saving required before running anything (model error margin)
+CLEAN_CHILD_MS = 80.0    # local ms, measured: clean probe ~37 ms + first-run costs of its tests
+WARM_CHILD_MS = 40.0     # local ms, measured: warm probe ~11 ms + first-run costs of its tests
+MIN_SAVING_MS = 250.0    # expected saving required before running anything (model error margin)
 P_FAIL = 0.5             # prior that the run set contains a failing test
 EXPENSIVE_S = 2.0        # tests at least this long are listed, never run (as in tools/mutants.py)
 MIN_EVIDENCE = 20        # calibration cases needed before an expensive test may be dropped
@@ -102,7 +102,18 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
     # Rank by how much more it costs to run than to list.
     order = sorted(candidates, key=lambda n: (-(run_cost[n] - 0.0), n))
     best = (static, None)
+    # Each additional listed test increases total listed load. Once even the
+    # ideal balanced schedule costs the incumbent, no longer prefix can win.
+    listed_load = longest = 0
     for j in range(len(order) + 1):
+        if j:
+            duration = ms[order[j - 1]]
+            listed_load += duration
+            longest = max(longest, duration)
+            lower = min(2000 * k + max(longest, (listed_load + k - 1) // k)
+                        for k in range(1, min(8, j) + 1))
+            if lower >= best[0]:
+                break
         listed, run = order[:j], order[j:]
         if not run:
             break
@@ -147,7 +158,7 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
     return plan
 
 
-WORKER_MS_FAIL = 2300.0    # a failure found in a run set with nothing else listed opens one worker
+WORKER_MS_FAIL = 2300.0    # a failure found in a run set with nothing else listed: one worker + its test
 
 
 def decide(selector, plans):
