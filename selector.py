@@ -1286,6 +1286,8 @@ def main():
 
 def decide(selector, plans):
     """Hook for runtime verification; the static answer is the candidate set itself."""
+    if os.environ.get('BR_NO_VERIFY'):
+        return [(c, s) for c, s, _, _ in plans]
     try:
         import verify_driver
     except ImportError:

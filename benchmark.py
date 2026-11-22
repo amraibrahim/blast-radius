@@ -13,10 +13,10 @@ if '--static' in sys.argv:
     sys.modules['verify_driver'] = None
 import selector as S
 
-tests = json.load(open(os.path.join(HERE, 'sample/tests.json')))['tests']
+tests = json.load(open(os.path.join(os.environ['BR_DATA'], 'tests.json')))['tests']
 ms = {t['number']: round(t['seconds'] * 1000) for t in tests}
 name = {t['number']: t['id'].split('/')[-1] for t in tests}
-answers = json.load(open(os.path.join(HERE, 'sample/answers.json')))['commits']
+answers = json.load(open(os.path.join(os.environ['BR_DATA'], 'answers.json')))['commits']
 buf = io.StringIO()
 t0 = time.process_time(); w0 = time.time()
 ch0 = os.times()
