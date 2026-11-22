@@ -1277,6 +1277,8 @@ def main():
     results = decide(selector, plans)
     # Experiments only (off by default): never list these test ids.
     drop = {t['number'] for t in selector.tests if t['id'] in set(filter(None, os.environ.get('BR_DROP', '').split(',')))}
+    if os.environ.get('BR_DROP_MIN_S'):
+        drop |= {t['number'] for t in selector.tests if t['seconds'] >= float(os.environ['BR_DROP_MIN_S'])}
     if drop:
         results = [(commit, set(chosen) - drop) for commit, chosen in results]
     out = []
