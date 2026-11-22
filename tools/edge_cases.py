@@ -45,3 +45,16 @@ for name, patch in cases.items():
     if cand == S.EVERYTHING:
         print(f'{name:18} EVERYTHING {reasons[:2]}'); continue
     print(f'{name:18} {len(cand):5} tests cost {S.cost_of(cand, ms)/1000:7.2f}s {[r[:4] for r in reasons][:3]}')
+
+more = {
+ 'new-method': edit('sqlglot/generators/clickhouse.py', '    def timestamptrunc_sql(self', '    def cot_sql(self, expression):\n        return "COT"\n\n    def timestamptrunc_sql(self'),
+ 'new-module-fn': edit('sqlglot/helper.py', 'def seq_get(', 'def brand_new_helper():\n    return 1\n\n\ndef seq_get('),
+ 'new-class-const': edit('sqlglot/dialects/tsql.py', '    LOG_BASE_FIRST = False', '    LOG_BASE_FIRST = False\n    SAFE_DIVISION = True'),
+ 'del-method': edit('sqlglot/generators/drill.py', '    def escape_sql(self', '    def _old_escape_sql(self'),
+ 'test-class-attr': edit('tests/test_optimizer.py', 'class TestOptimizer(unittest.TestCase):\n    maxDiff = None', 'class TestOptimizer(unittest.TestCase):\n    maxDiff = 1'),
+}
+for name, patch in more.items():
+    cand, reasons, _ = sel.analyze(patch)
+    if cand == S.EVERYTHING:
+        print(f'{name:18} EVERYTHING {reasons[:2]}'); continue
+    print(f'{name:18} {len(cand):5} tests cost {S.cost_of(cand, ms)/1000:7.2f}s {[r[:5] for r in reasons][:3]}')

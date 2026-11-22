@@ -74,7 +74,7 @@ def failure_prior(reasons):
     return P_FAIL
 
 
-IMPORT_TIME = {'module-names', 'module-stmt', 'module-gap', 'import-same-bindings', 'class-body',
+IMPORT_TIME = {'inserted-member', 'inserted-module', 'module-names', 'module-stmt', 'module-gap', 'import-same-bindings', 'class-body',
                'class-attr', 'class-unseen', 'def'}
 
 

@@ -150,7 +150,8 @@ def apply_hunks(old_text, hunks):
         old = old[:-1]
     out = []
     cursor = 0
-    deleted, inserts, added = set(), set(), set()
+    deleted, added = set(), set()
+    inserts = {}                 # old gap point -> new line numbers inserted there
     old_to_new = {}
     new_eof_newline = trailing_newline
     for start, body, no_newline in hunks:
@@ -166,7 +167,8 @@ def apply_hunks(old_text, hunks):
         for tag, text in body:
             if tag == ' ':
                 if not run_deleted:
-                    inserts.update(pending)
+                    for point, line in pending:
+                        inserts.setdefault(point, []).append(line)
                 pending, run_deleted = [], False
             elif tag == '-':
                 run_deleted = True
@@ -180,11 +182,12 @@ def apply_hunks(old_text, hunks):
                     out.append(text)
                 cursor += 1
             else:
-                pending.append(cursor)       # inserted after old line `cursor` (0 = top)
                 out.append(text)
                 added.add(len(out))
+                pending.append((cursor, len(out)))   # inserted after old line `cursor` (0 = top)
         if not run_deleted:
-            inserts.update(pending)
+            for point, line in pending:
+                inserts.setdefault(point, []).append(line)
         if no_newline:
             last_tag = body[-1][0] if body else ' '
             if '+' in no_newline or (' ' in no_newline and last_tag == ' '):
@@ -522,6 +525,10 @@ class Selector:
                 found = st.innermost(n)
                 candidates = [found] if found else []
             else:
+                handled = self.inserted_definitions(path, new_st, inserts.get(n, ()), is_test, reasons)
+                if handled is not None:
+                    selected |= handled
+                    continue
                 before, after = st.statements_around(n)
                 # an inserted line sits in the block of its nearest neighbours
                 candidates = [x for x in (before, after) if x]
@@ -537,6 +544,53 @@ class Selector:
             for start, end, node, chain in candidates:
                 selected |= self.region(path, st, start, end, node, chain, n, kind, is_test, reasons)
         return selected
+
+    def inserted_definitions(self, path, new_st, new_lines, is_test, reasons):
+        """Whole statements inserted into a class body or at module level bind new names (a new
+        method can override what a base class did). Returns None when the insertion is inside a
+        function body or inside an existing statement; the caller then uses its neighbours."""
+        lines = set(new_lines)
+        if not lines:
+            return None
+        tops = []
+        for start, end, node, chain in new_st.nodes:
+            if not isinstance(node, ast.stmt) or not all(k in lines for k in range(start, end + 1)):
+                continue
+            parent = chain[-1] if chain else None
+            if parent is not None and isinstance(parent, ast.stmt) and \
+                    all(k in lines for k in range(parent.lineno, parent.end_lineno + 1)):
+                continue      # not maximal: its parent is inserted too
+            tops.append((node, chain))
+        if not tops:
+            return None
+        out = set()
+        for node, chain in tops:
+            scope = next((c for c in reversed(chain) if isinstance(c, SCOPES)), None)
+            if isinstance(scope, FUNCS + (ast.Lambda,)):
+                return None
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                reasons.append(('inserted-constant-expr', path))
+                continue      # a bare string/docstring adds no binding
+            names = bound_names(node)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = set(self._changed_imports.get(path, names))
+            if isinstance(scope, ast.ClassDef):
+                qual = qualname(chain[:chain.index(scope)], scope)
+                users = self.test_class_users(path, qual) if is_test else self.class_users(path, qual)
+                if users is None:
+                    users = self.file_cover(path)
+                readers = self.attribute_readers(names) if names and not is_test else None
+                got = set(users) & readers if readers is not None else set(users)
+                reasons.append(('inserted-member', path, qual, sorted(names)[:3], len(got)))
+                out |= got
+            else:
+                if is_test:
+                    got = set(self.by_file.get(path, ())) | self.test_importers(path)
+                else:
+                    got, _ = self.references(names, path, module_scope=True) if names else (set(), False)
+                reasons.append(('inserted-module', path, sorted(names)[:3], len(got)))
+                out |= got
+        return out
 
     def opens_for(self, path):
         i = self.opens.get(path)
@@ -629,6 +683,10 @@ class Selector:
         """Tests that execute a line reading attribute `names` at run time, or None when the
         attribute may be consumed in a way line coverage cannot see (import/class-creation time,
         getattr by string, bare-name use in a class body)."""
+        for prefix, suffix in self.dynamic_patterns():
+            if any(n.startswith(prefix) and n.endswith(suffix) and len(n) > len(prefix) + len(suffix) - 1
+                   for n in names):
+                return None   # looked up by a computed name (e.g. generator `<key>_sql` dispatch)
         out = set()
         for rel, text in self.all_sources().items():
             if not any(n in text for n in names):
@@ -679,6 +737,56 @@ class Selector:
             if rel.startswith('tests/') and (mod in text or f'import {short}' in text and mod.rsplit('.', 1)[0] in text):
                 out |= self.by_file.get(rel, set())
         return out
+
+    def dynamic_patterns(self):
+        """(prefix, suffix) of attribute names sqlglot reads by computed name: getattr/hasattr with
+        an f-string or concatenation, or a dir() scan of a class filtered by startswith/endswith.
+        ('', '') means any name."""
+        if getattr(self, '_dynamic', None) is not None:
+            return self._dynamic
+        found = set()
+        for rel, text in self.all_sources().items():
+            if not rel.startswith('sqlglot/') or ('getattr' not in text and 'dir(' not in text):
+                continue
+            try:
+                tree = self.structure(rel).tree
+            except SyntaxError:
+                continue
+            for fn in ast.walk(tree):
+                if not isinstance(fn, FUNCS):
+                    continue
+                modules = {t.id for a in ast.walk(fn) if isinstance(a, ast.Assign)
+                           and isinstance(a.value, ast.Call) and 'import_module' in ast.unparse(a.value.func)
+                           for t in a.targets if isinstance(t, ast.Name)}
+                filters = set()
+                for c in ast.walk(fn):
+                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and \
+                            c.func.attr in ('startswith', 'endswith') and c.args and \
+                            isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str):
+                        filters.add((c.args[0].value, '') if c.func.attr == 'startswith' else ('', c.args[0].value))
+                for c in ast.walk(fn):
+                    if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)):
+                        continue
+                    if c.func.id == 'dir' and c.args:
+                        if isinstance(c.args[0], ast.Name) and c.args[0].id in modules:
+                            continue          # module attributes, not class attributes
+                        suffixes = {f for f in filters if f[1]}
+                        found |= suffixes or filters or {('', '')}
+                    elif c.func.id in ('getattr', 'hasattr') and len(c.args) >= 2:
+                        arg = c.args[1]
+                        if isinstance(arg, ast.JoinedStr) and arg.values:
+                            first, last = arg.values[0], arg.values[-1]
+                            prefix = first.value if isinstance(first, ast.Constant) else ''
+                            suffix = last.value if isinstance(last, ast.Constant) and last is not first else ''
+                            if prefix or suffix:
+                                found.add((prefix, suffix))
+                        elif isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
+                            prefix = arg.left.value if isinstance(arg.left, ast.Constant) else ''
+                            suffix = arg.right.value if isinstance(arg.right, ast.Constant) else ''
+                            if prefix or suffix:
+                                found.add((prefix, suffix))
+        self._dynamic = found
+        return found
 
     def test_importers(self, path):
         mod = self.module_name(path)
