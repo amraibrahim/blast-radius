@@ -50,6 +50,9 @@ more = {
  'new-method': edit('sqlglot/generators/clickhouse.py', '    def timestamptrunc_sql(self', '    def cot_sql(self, expression):\n        return "COT"\n\n    def timestamptrunc_sql(self'),
  'new-module-fn': edit('sqlglot/helper.py', 'def seq_get(', 'def brand_new_helper():\n    return 1\n\n\ndef seq_get('),
  'new-class-const': edit('sqlglot/dialects/tsql.py', '    LOG_BASE_FIRST = False', '    LOG_BASE_FIRST = False\n    SAFE_DIVISION = True'),
+ 'cache-fill': edit('sqlglot/generator.py', '        if expr_cls and expr_cls not in dispatch:', '        if expr_cls and expr_cls in dispatch:'),
+ 'table-value': edit('sqlglot/dialects/snowflake.py', '"u": (16, 4, 4, 0xFFFF)', '"u": (17, 4, 4, 0xFFFF)'),
+ 'table-cached': edit('sqlglot/generators/druid.py', 'f"ARRAY[{self.expressions(e)}]"', 'f"ARRAY({self.expressions(e)})"'),
  'del-method': edit('sqlglot/generators/drill.py', '    def escape_sql(self', '    def _old_escape_sql(self'),
  'test-class-attr': edit('tests/test_optimizer.py', 'class TestOptimizer(unittest.TestCase):\n    maxDiff = None', 'class TestOptimizer(unittest.TestCase):\n    maxDiff = 1'),
 }

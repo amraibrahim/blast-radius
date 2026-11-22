@@ -74,6 +74,32 @@ index = {'commit': 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa', 'tests': tests, '
          'classes': classes}
 if core:
     index['core_modules'] = core
+table_profile = os.environ.get('TABLE_PROFILE')
+if table_profile:
+    # per class-level dict literal: key order and which tests read/checked which keys
+    raw_tables = json.load(open(table_profile))
+    tables = {}
+    for site, accesses in raw_tables['access'].items():
+        entry = {'imp': [], 'a': {}}
+        for access_key, who in accesses.items():
+            ids = set()
+            for t in who:
+                if t == '':
+                    entry['imp'].append(access_key)
+                elif t.startswith('@class:'):
+                    ids.update(by_class.get(t[len('@class:'):], ()))
+                elif t in num:
+                    ids.add(num[t])
+            if ids:
+                entry['a'][access_key] = intern(ids)
+            elif access_key[0] in 'KVM':
+                entry['a'][access_key] = intern(())
+        if site in raw_tables['order']:
+            entry['o'] = raw_tables['order'][site]
+        tables[site] = entry
+    for site, order in raw_tables['order'].items():
+        tables.setdefault(site, {'imp': [], 'a': {}, 'o': order})
+    index['tables'] = tables
 cmp_profile = os.environ.get('CMP_PROFILE')
 if cmp_profile:
     # comparison sites whose operator twins never disagreed in the pinned suite (build_cmp_profile)

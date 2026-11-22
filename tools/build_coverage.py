@@ -3,7 +3,7 @@ and per-test file reads. Reads no patches and no answers.
 
 usage: python tools/build_coverage.py SQLGLOT_CHECKOUT OUT.json
 """
-import json, os, sys, time
+import dis, json, os, sys, time
 from collections import defaultdict
 from pathlib import Path
 
@@ -57,8 +57,34 @@ def on_line(code, line):
         bucket.add((fn, line))
     return mon.DISABLE
 
+PROLOGUE = {'RESUME', 'MAKE_CELL', 'COPY_FREE_VARS', 'RETURN_GENERATOR', 'POP_TOP', 'NOP', 'CACHE'}
+_first_line = {}
+
+def first_body_line(code):
+    """Line of the first instruction after the prologue. LINE fires only when the line changes,
+    so a body that starts on its own definition line (a lambda, `def f(): return x`) never
+    produces a LINE event for that line; PY_START records it instead."""
+    line = _first_line.get(code)
+    if line is None:
+        line = 0
+        for ins in dis.get_instructions(code):
+            if ins.opname not in PROLOGUE and ins.positions and ins.positions.lineno:
+                line = ins.positions.lineno
+                break
+        _first_line[code] = line
+    return line
+
+def on_start(code, offset):
+    fn = code.co_filename
+    if fn.startswith(SRC):
+        line = first_body_line(code)
+        if line:
+            bucket.add((fn, line))
+    return mon.DISABLE
+
 mon.register_callback(TOOL, mon.events.LINE, on_line)
-mon.set_events(TOOL, mon.events.LINE)
+mon.register_callback(TOOL, mon.events.PY_START, on_start)
+mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 opens = defaultdict(set)
 outcomes = {}
 prefix = str(ROOT) + os.sep

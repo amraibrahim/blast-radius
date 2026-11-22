@@ -83,7 +83,7 @@ def failure_prior(reasons):
     return P_FAIL
 
 
-IMPORT_TIME = {'module-import', 'inserted-member', 'inserted-module', 'module-names', 'module-stmt', 'module-gap', 'import-same-bindings', 'class-body',
+IMPORT_TIME = {'class-table', 'module-import', 'inserted-member', 'inserted-module', 'module-names', 'module-stmt', 'module-gap', 'import-same-bindings', 'class-body',
                'class-attr', 'class-unseen', 'def'}
 
 
@@ -202,7 +202,8 @@ def decide(selector, plans):
             if p.run and p.est_ms / 1000 / CPU_FACTOR * 1.5 > remaining:
                 p.run = []          # out of budget: list the candidates instead
                 p.listed = set(p.candidates)
-                continue
+                if not p.probe or remaining < 1.0:
+                    continue        # an import probe alone is cheap; still run it when required
             ids = [selector.by_number[n]['id'] for n in sorted(p.run)]
             pid, fd = verify.start(selector.root, p.sources, ids, timeouts)
             limit = time.time() + max(5.0, 4 * p.est_ms / 1000 / CPU_FACTOR + 3)
@@ -243,6 +244,18 @@ def warm(root):
         log('warm import failed', repr(exc))
 
 
+def class_tests(selector, description):
+    """Every test of the class named in a unittest fixture error such as
+    'setUpClass (tests.test_x.TestX)': a failed class fixture fails all of that class's tests."""
+    import re
+    m = re.search(r'\(([\w.]+)\)', description or '')
+    if not m or '.' not in m.group(1):
+        return set()
+    module, cls = m.group(1).rsplit('.', 1)
+    prefix = f"{module.replace('.', '/')}.py::{cls}::"
+    return {t['number'] for t in selector.tests if t['id'].startswith(prefix)}
+
+
 def absorb(selector, plan, result):
     if 'failed' not in result:
         log(plan.commit, 'verification error', result.get('error'))
@@ -251,22 +264,33 @@ def absorb(selector, plan, result):
     number_of = {t['id']: t['number'] for t in selector.tests}
     run = set(plan.run)
     failed = set()
+    broken = []
     for item in result['failed']:
         if isinstance(item, list):           # ['FILE', path], ['IMPORT', module path] or ['ERR', ...]
             if item[0] == 'IMPORT':
-                dependents = selector.import_dependents(item[1])
-                log(plan.commit, 'changed module fails to import', item[1])
-                plan.listed = set(selector.all) if dependents == 'everything' else \
-                    set(plan.listed) | set(plan.candidates) | dependents
-                return
-            if item[0] == 'FILE':
+                broken.append(item[1])
+            elif item[0] == 'FILE':
+                # a test file that cannot be imported fails every test in it, run or not
                 failed |= {n for n in run if selector.by_number[n]['file'] == item[1]}
+                failed |= set(selector.by_file.get(item[1], ()))
             else:
-                failed |= run
+                failed |= run | class_tests(selector, item[1] if len(item) > 1 else '')
         elif item in number_of and number_of[item] in run:
             failed.add(number_of[item])
         else:
             failed |= run                    # unrecognised report: be safe
+    if broken:
+        # changed modules that no longer import: everything depending on any of them fails
+        listed = set(plan.listed) | set(plan.candidates) | failed
+        for module in broken:
+            log(plan.commit, 'changed module fails to import', module)
+            dependents = selector.import_dependents(module)
+            if dependents == 'everything':
+                plan.listed = set(selector.all)
+                return
+            listed |= set(dependents)
+        plan.listed = listed
+        return
     if failed and plan.conditional:
         failed |= plan.conditional           # a cheap failure: the dropped expensive tests come back
     log(plan.commit, f'ran {len(run)} failed {len(failed)} est {plan.est_ms/CPU_FACTOR:.0f}ms local, actual {result.get("cpu", 0)*1000:.0f}ms, saving {plan.saving/1000:.2f}s')

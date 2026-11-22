@@ -61,6 +61,68 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(cost, 2012)
 
 
+def _driver():
+    import importlib
+    sys.modules.pop('verify_driver', None)
+    try:
+        return importlib.import_module('verify_driver')
+    finally:
+        sys.modules['verify_driver'] = None
+
+
+class _FakeSelector:
+    def __init__(self, tests, dependents):
+        self.tests = [{'number': i, 'id': t, 'file': t.split('::')[0], 'seconds': 0.1} for i, t in enumerate(tests)]
+        self.by_number = {t['number']: t for t in self.tests}
+        self.by_file = {}
+        for t in self.tests:
+            self.by_file.setdefault(t['file'], set()).add(t['number'])
+        self.all = set(self.by_number)
+        self._dependents = dependents
+
+    def import_dependents(self, module):
+        return self._dependents[module]
+
+
+class AbsorbTests(unittest.TestCase):
+    """Evidence the verifier already found must reach the listed set in full."""
+    TESTS = ['tests/a.py::A::t1', 'tests/a.py::A::t2', 'tests/b.py::B::t1', 'tests/c.py::C::t1', 'tests/c.py::C::t2']
+
+    def plan(self, D, candidates, run):
+        p = D.Plan('x', candidates, {})
+        p.run = sorted(run)
+        p.listed = set(candidates) - set(run)
+        return p
+
+    def test_file_import_failure_lists_whole_file(self):
+        D = _driver()
+        sel = _FakeSelector(self.TESTS, {})
+        p = self.plan(D, {0}, {0})              # only t1 of tests/a.py was a candidate
+        D.absorb(sel, p, {'failed': [['FILE', 'tests/a.py']]})
+        self.assertEqual(p.listed, {0, 1})
+
+    def test_every_broken_module_counts(self):
+        D = _driver()
+        sel = _FakeSelector(self.TESTS, {'sqlglot/m1.py': {2}, 'sqlglot/m2.py': {3}})
+        p = self.plan(D, {0}, {0})
+        D.absorb(sel, p, {'failed': [['IMPORT', 'sqlglot/m1.py'], ['IMPORT', 'sqlglot/m2.py']]})
+        self.assertEqual(p.listed, {0, 2, 3})
+
+    def test_class_fixture_failure_lists_whole_class(self):
+        D = _driver()
+        sel = _FakeSelector(self.TESTS, {})
+        p = self.plan(D, {3}, {3})
+        D.absorb(sel, p, {'failed': [['ERR', 'setUpClass (tests.c.C)']]})
+        self.assertEqual(p.listed, {3, 4})
+
+    def test_passing_run_lists_nothing_extra(self):
+        D = _driver()
+        sel = _FakeSelector(self.TESTS, {})
+        p = self.plan(D, {0, 3}, {0})
+        D.absorb(sel, p, {'failed': []})
+        self.assertEqual(p.listed, {3})
+
+
 @unittest.skipUnless(os.path.isdir(ROOT), 'pinned checkout not available')
 class SampleSafetyTests(unittest.TestCase):
     """Static candidates must contain every failing sample test (the verifier only removes)."""

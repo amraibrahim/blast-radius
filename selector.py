@@ -290,6 +290,98 @@ def qualname(chain, node=None):
     return '.'.join(parts)
 
 
+SAFE_EXPR = (ast.Constant, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Name, ast.Attribute, ast.Lambda,
+             ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.Load, ast.arguments, ast.arg, ast.expr_context,
+             ast.unaryop, ast.operator, ast.boolop)
+
+
+def _side_effect_free(node):
+    """An expression whose evaluation runs no user code: literals, containers, name/attribute
+    lookups, arithmetic on those, and lambdas (whose bodies only run when called)."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Lambda):
+            continue
+        if not isinstance(n, SAFE_EXPR) and not _inside_lambda(node, n):
+            return False
+    return True
+
+
+def _inside_lambda(root, target):
+    for n in ast.walk(root):
+        if isinstance(n, ast.Lambda) and any(m is target for m in ast.walk(n.body)):
+            return True
+    return False
+
+
+CACHE_FACTORIES = {'dict', 'set', 'list', 'defaultdict', 'OrderedDict', 'WeakKeyDictionary',
+                   'WeakValueDictionary'}
+CACHE_STORES = {'setdefault', 'update', 'add', 'append', 'extend', '__setitem__'}
+MEMO_DECORATORS = {'lru_cache', 'cache', 'cached_property'}
+
+
+def cache_fill_spans(tree):
+    """[(fill_start, fill_end, owner_start, owner_end, owner_name)] for process-wide memoization:
+    code that only runs on a cache miss (the branch that stores into a module-level container,
+    and same-module functions called from it, transitively). Per-test coverage charges that code
+    to whichever test filled the cache first; every test running the owner depends on it."""
+    caches = set()
+    module_funcs = {}
+    for node in tree.body:
+        value = getattr(node, 'value', None)
+        targets = node.targets if isinstance(node, ast.Assign) else \
+            [node.target] if isinstance(node, ast.AnnAssign) else []
+        if value is not None and (isinstance(value, (ast.Dict, ast.Set, ast.List)) or
+                                  isinstance(value, ast.Call) and _call_name(value) in CACHE_FACTORIES):
+            caches |= {t.id for t in targets if isinstance(t, ast.Name)}
+        if isinstance(node, FUNCS):
+            module_funcs[node.name] = node
+    out = []
+    if not caches:
+        return out
+
+    def stores(node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript) and isinstance(sub.ctx, ast.Store) and \
+                    isinstance(sub.value, ast.Name) and sub.value.id in caches:
+                return True
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and \
+                    sub.func.attr in CACHE_STORES and isinstance(sub.func.value, ast.Name) and \
+                    sub.func.value.id in caches:
+                return True
+        return False
+
+    def owners(body):
+        for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+            if isinstance(node, FUNCS):
+                yield node
+
+    for func in owners(tree.body):
+        for node in ast.walk(func):
+            if not isinstance(node, ast.If) or node is func:
+                continue
+            branch = next((b for b in (node.body, node.orelse) if b and any(stores(s) for s in b)), None)
+            if branch is None or not any(stores(s) for s in branch) or stores(node.test):
+                continue
+            fills = [(branch[0].lineno, branch[-1].end_lineno)]
+            seen, todo = set(), [s for s in branch]
+            while todo:
+                for sub in ast.walk(todo.pop()):
+                    name = _call_name(sub) if isinstance(sub, ast.Call) else None
+                    if name in module_funcs and name not in seen and module_funcs[name] is not func:
+                        seen.add(name)
+                        fn = module_funcs[name]
+                        fills.append((min([fn.lineno] + [d.lineno for d in fn.decorator_list]), fn.end_lineno))
+                        todo.extend(fn.body)
+            for a, b in fills:
+                out.append((a, b, func.lineno, func.end_lineno, func.name))
+    return out
+
+
+def _call_name(call):
+    f = call.func
+    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+
+
 TWINS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot),
          (ast.Lt, ast.LtE), (ast.LtE, ast.Lt), (ast.Gt, ast.GtE), (ast.GtE, ast.Gt)}
 
@@ -318,18 +410,32 @@ def walk_scoped(tree):
             stack.extend((n, inside) for n in ast.iter_child_nodes(node))
 
 
-def changed_top_level(old_tree, new_tree):
+def _stmt_text(lines, node):
+    start = min([node.lineno] + [d.lineno for d in getattr(node, 'decorator_list', ())])
+    return lines[start - 1:node.end_lineno]
+
+
+def changed_top_level(old_tree, new_tree, old_text=None, new_text=None):
     """Pairs of top-level statements whose (location-free) dumps differ, or None when the
-    module's top-level layout changed."""
+    module's top-level layout changed. Statements with identical source text parse identically,
+    so only textually different ones are dumped."""
     if len(old_tree.body) != len(new_tree.body):
         return None
-    return [(o, n) for o, n in zip(old_tree.body, new_tree.body) if ast.dump(o) != ast.dump(n)]
+    old_lines = old_text.split('\n') if old_text is not None else None
+    new_lines = new_text.split('\n') if new_text is not None else None
+    out = []
+    for o, n in zip(old_tree.body, new_tree.body):
+        if old_lines is not None and new_lines is not None and _stmt_text(old_lines, o) == _stmt_text(new_lines, n):
+            continue
+        if ast.dump(o) != ast.dump(n):
+            out.append((o, n))
+    return out
 
 
-def twin_swap_site(old_tree, new_tree):
+def twin_swap_site(pairs):
     """(line, col) of the one single-operator comparison whose operator was swapped for its twin
-    (is/==, is not/!=, </<=, >/>=) when that is the patch's only change to the module, else None."""
-    pairs = changed_top_level(old_tree, new_tree)
+    (is/==, is not/!=, </<=, >/>=) when that is the patch's only change to the module, else None.
+    `pairs` is changed_top_level's result."""
     if not pairs or len(pairs) != 1:
         return None
     old_tree, new_tree = pairs[0]
@@ -464,6 +570,8 @@ class Selector:
         self._changed_imports = {}
         self._dynamic = None
         self.equivalent_sites = set(index.get('equivalent_sites', ()))
+        self.tables = index.get('tables', {})
+        self._new_trees = {}
         self._patched = {}
 
     # -- index access
@@ -650,10 +758,12 @@ class Selector:
             reasons.append(('syntax-error', path))
             return self.import_dependents(path)
         selected = set(self.opens_for(path))
-        if changed_top_level(old_tree, new_tree) == []:
+        pairs = changed_top_level(old_tree, new_tree, old, new)
+        if pairs == []:
             reasons.append(('ast-identical', path, len(selected)))
             return selected
-        site = twin_swap_site(old_tree, new_tree)
+        self._new_trees[path] = new_tree
+        site = twin_swap_site(pairs)
         if site is not None and f'{path}:{site[0]}:{site[1]}' in self.equivalent_sites:
             # The comparison and its twin agreed on every value the whole suite fed it, so every
             # test runs exactly as before.
@@ -694,6 +804,13 @@ class Selector:
                 continue
             for start, end, node, chain in candidates:
                 selected |= self.region(path, st, start, end, node, chain, n, kind, is_test, reasons)
+        if not is_test:
+            fills = [f for f in cache_fill_spans(old_tree)
+                     if any(f[0] <= n <= f[1] for kind, n in regions)]
+            for a, b, oa, ob, owner in fills:
+                got = self.line_cover(path, range(oa, ob + 1))
+                reasons.append(('cache-fill', path, a, owner, len(got)))
+                selected |= got
         return selected
 
     def inserted_definitions(self, path, new_st, new_lines, is_test, reasons):
@@ -784,6 +901,10 @@ class Selector:
             owner_chain = chain[:chain.index(owner)] if owner is not None else ()
         if owner is not None:
             qual = qualname(owner_chain, owner)
+            if not is_test and node is not owner and any(stmt is node for stmt in owner.body):
+                got = self.table_entry_tests(path, qual, node, line, reasons)
+                if got is not None:
+                    return got
             if is_test:
                 users = self.test_class_users(path, qual)
             else:
@@ -836,6 +957,106 @@ class Selector:
         cover = self.file_cover(path) | refs
         reasons.append(('module-stmt', path, line, type(node).__name__, len(cover)))
         return cover
+
+    def table_entry_tests(self, path, qual, node, line, reasons):
+        """Edits to entries of a class-level dict literal (a dialect's FUNCTIONS, NUMERIC_ESCAPES,
+        ...): the tests that read or checked exactly those keys in the pinned suite, or None when
+        the table profile cannot vouch for it (its values were read in bulk, it was copied or
+        enumerated while tests ran, mutated, or a changed key was consulted while classes were
+        being built)."""
+        target = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+        if target is None or not isinstance(node.value, ast.Dict):
+            return None
+        site = f'{path}:{qual}.{target}'
+        profile = self.tables.get(site)
+        new_node = self.new_class_stmt(path, qual, target)
+        if profile is None or new_node is None or not isinstance(new_node.value, ast.Dict):
+            return None
+        old_d, new_d = node.value, new_node.value
+        dump = ast.dump
+        old_spreads = [dump(v) for k, v in zip(old_d.keys, old_d.values) if k is None]
+        new_spreads = [dump(v) for k, v in zip(new_d.keys, new_d.values) if k is None]
+        if old_spreads != new_spreads:
+            return None
+        old_entries = [(k, v) for k, v in zip(old_d.keys, old_d.values) if k is not None]
+        new_entries = [(k, v) for k, v in zip(new_d.keys, new_d.values) if k is not None]
+        order = profile.get('o')
+        imported = set(profile.get('imp', ()))
+        runtime = set(profile['a'])
+        # whole-value reads or mutation anywhere; or key enumeration while tests run, which is how
+        # a table gets copied into a lazily built cache (e.g. a per-class dispatch dict) whose
+        # later users never touch the table again
+        bulk = {'V', 'M'} & (imported | runtime) | {'I', 'K'} & runtime
+        changed = set()
+        edited = []
+        same_keys = len(old_entries) == len(new_entries) and all(
+            dump(a[0]) == dump(b[0]) for a, b in zip(old_entries, new_entries))
+        if same_keys:
+            # only values changed: map each edited entry to its runtime key by source position
+            if order is None or len(order) != len(old_entries) or len(set(order)) != len(order):
+                return None
+            for j, (a, b) in enumerate(zip(old_entries, new_entries)):
+                if dump(a[1]) != dump(b[1]):
+                    changed.add(order[j])
+                    edited += [a[1], b[1]]
+            kinds = ('g',)
+        else:
+            # keys added, removed or renamed: only literal keys can be matched safely
+            def literal(k):
+                try:
+                    value = ast.literal_eval(k)
+                except ValueError:
+                    return None
+                return repr(value) if isinstance(value, (str, int, float, bool, bytes, tuple, type(None))) else None
+            old_keys = [literal(k) for k, _ in old_entries]
+            new_keys = [literal(k) for k, _ in new_entries]
+            if None in old_keys or None in new_keys or len(set(old_keys)) != len(old_keys) \
+                    or len(set(new_keys)) != len(new_keys):
+                return None
+            old_map = {k: dump(v) for k, (_, v) in zip(old_keys, old_entries)}
+            new_map = {k: dump(v) for k, (_, v) in zip(new_keys, new_entries)}
+            changed = set(old_map) ^ set(new_map)
+            changed |= {k for k in set(old_map) & set(new_map) if old_map[k] != new_map[k]}
+            edited += [v for k, (_, v) in zip(old_keys, old_entries) if k in changed]
+            edited += [v for k, (_, v) in zip(new_keys, new_entries) if k in changed]
+            bulk |= {'I', 'L', 'K'} & (imported | runtime)   # the key set itself was consumed
+            kinds = ('g', 'h')
+        if bulk or not changed:
+            return None
+        # every edited entry must be side-effect free to evaluate at class creation (no calls,
+        # comprehensions, walrus, ...); then the only difference is what the entry's readers see
+        if not all(_side_effect_free(v) for v in edited):
+            return None
+        if any(f'{kind}|{key}' in imported for key in changed for kind in kinds):
+            return None
+        out = set()
+        for key in changed:
+            for kind in kinds:
+                i = profile['a'].get(f'{kind}|{key}')
+                if i is not None:
+                    out |= self.tset(i)
+        reasons.append(('class-table', path, line, site, sorted(changed)[:3], len(out)))
+        return out
+
+    def new_class_stmt(self, path, qual, target):
+        tree = self._new_trees.get(path)
+        if tree is None:
+            return None
+        body = tree.body
+        for name in qual.split('.'):
+            found = [c for c in body if isinstance(c, ast.ClassDef) and c.name == name]
+            if len(found) != 1:
+                return None
+            body = found[0].body
+        hits = [stmt for stmt in body if
+                (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                 and stmt.targets[0].id == target) or
+                (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == target)]
+        return hits[0] if len(hits) == 1 else None
 
     def attribute_readers(self, names):
         """Tests that execute a line reading attribute `names` at run time, or None when the
