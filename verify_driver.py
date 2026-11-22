@@ -1,0 +1,168 @@
+"""Decide, per commit, whether running candidate tests now is cheaper than listing them.
+
+Listing a candidate set C costs sched(C) (busiest worker + 2 s/worker). Running a subset R of it
+here costs its CPU, and then only the tests that actually failed need listing. The expensive
+tests (e.g. a 28 s parser stress test) are cheaper to list than to run, so the plan is: list the
+expensive top of C directly, run the cheap rest, and list whatever of the rest fails.
+
+Safety: any test whose run errors, times out, or whose file fails to import is listed. If a child
+dies or the wall budget runs out, the whole candidate set is listed, exactly as without running.
+"""
+import os
+import select
+import signal
+import sys
+import time
+
+import verify
+from selector import schedule, log
+
+# Scorer CPU per local CPU second. Calibrated from the pinned suite: recorded seconds (labeling
+# machine) / CPU measured here, median over tests > 50 ms. Override with BR_CPU_FACTOR.
+CPU_FACTOR = float(os.environ.get('BR_CPU_FACTOR', '2.2'))
+FORK_MS = 250.0          # scorer ms per verification child: fork, sqlglot import, patched compile
+P_FAIL = 0.5             # prior that the run set contains a failing test
+PARALLEL = 2             # the run has 2 cores
+WALL_PER_COMMIT = 3.5    # seconds of wall budget per commit for verification
+WALL_CAP = 150.0
+
+
+class Plan:
+    def __init__(self, commit, candidates, sources):
+        self.commit = commit
+        self.candidates = set(candidates)
+        self.sources = sources
+        self.listed = set(candidates)       # what we print if nothing is run
+        self.run = []
+        self.est_ms = 0.0
+        self.saving = 0.0
+
+
+def estimate(selector, index, numbers):
+    """Scorer-ms to run `numbers` in one child."""
+    cpu = index.get('cpu_ms', {})
+    cls_cpu = index.get('class_cpu_ms', {})
+    imp = index.get('import_cpu_ms', {})
+    total = FORK_MS / CPU_FACTOR
+    classes, files = set(), set()
+    for n in numbers:
+        t = selector.by_number[n]
+        total += cpu.get(t['id'], t['seconds'] * 1000 / CPU_FACTOR) + 0.3
+        classes.add(t['id'].rsplit('::', 1)[0])
+        files.add(t['file'])
+    total += sum(cls_cpu.get(c, 0.0) for c in classes)
+    total += sum(imp.get(f, 5.0) for f in files)
+    return total * CPU_FACTOR
+
+
+def failure_prior(reasons):
+    """Chance that some candidate fails. A test that reads an edited data file (fixture) almost
+    always fails; code edits split roughly evenly between breaking and not breaking."""
+    if any(r[0] == 'data-file' and r[2] > 0 for r in reasons):
+        return 0.9
+    return P_FAIL
+
+
+def plan_commit(selector, index, commit, candidates, sources, reasons=()):
+    plan = Plan(commit, candidates, sources)
+    p_fail = failure_prior(reasons)
+    if not candidates or len(candidates) >= len(selector.all) * 0.5:
+        return plan                      # nothing to run, or so broad that listing is cheaper
+    ms = selector.ms
+    static = schedule(candidates, ms)[1]
+    cpu = index.get('cpu_ms', {})
+    run_cost = {n: cpu.get(selector.by_number[n]['id'], ms[n] / CPU_FACTOR) * CPU_FACTOR for n in candidates}
+    # Rank by how much more it costs to run than to list.
+    order = sorted(candidates, key=lambda n: (-(run_cost[n] - 0.0), n))
+    best = (static, None)
+    for j in range(len(order) + 1):
+        listed, run = order[:j], order[j:]
+        if not run:
+            break
+        listed_cost = schedule(listed, ms)[1] if listed else 0.0
+        extra = WORKER_MS_FAIL if not listed else 1000.0
+        cost = estimate(selector, index, run) + listed_cost + p_fail * extra
+        if cost < best[0]:
+            best = (cost, (set(listed), run))
+    if best[1] is not None:
+        plan.listed, plan.run = best[1]
+        plan.est_ms = estimate(selector, index, plan.run)
+        plan.saving = static - best[0]
+    return plan
+
+
+WORKER_MS_FAIL = 2300.0    # a failure found in a run set with nothing else listed opens one worker
+
+
+def decide(selector, plans):
+    index = selector.index if hasattr(selector, 'index') else {}
+    started = time.time()
+    budget = min(WALL_CAP, WALL_PER_COMMIT * max(1, len(plans)))
+    work = [plan_commit(selector, index, c, s, src, r) for c, s, r, src in plans]
+    queue = sorted((p for p in work if p.run), key=lambda p: -p.saving)
+    if queue:
+        verify.preload()
+        sys.stdout.flush()
+        sys.stderr.flush()
+    running = {}
+    timeouts = {}
+    cpu = index.get('cpu_ms', {})
+    for t in selector.tests:
+        local = cpu.get(t['id'], t['seconds'] * 1000) / 1000
+        timeouts[t['id']] = max(3.0, 8 * local)
+    pending = list(queue)
+    while pending or running:
+        while pending and len(running) < PARALLEL:
+            p = pending.pop(0)
+            remaining = budget - (time.time() - started)
+            if p.est_ms / 1000 / CPU_FACTOR * 1.5 > remaining:
+                p.run = []          # out of budget: list the candidates instead
+                p.listed = set(p.candidates)
+                continue
+            ids = [selector.by_number[n]['id'] for n in sorted(p.run)]
+            pid, fd = verify.start(selector.root, p.sources, ids, timeouts)
+            limit = time.time() + max(5.0, 4 * p.est_ms / 1000 / CPU_FACTOR + 3)
+            running[fd] = (p, pid, limit)
+        if not running:
+            break
+        ready, _, _ = select.select(list(running), [], [], 0.5)
+        now = time.time()
+        for fd in list(running):
+            p, pid, limit = running[fd]
+            if fd in ready:
+                result = verify.finish(pid, fd)
+                del running[fd]
+                absorb(selector, p, result)
+            elif now > limit or now - started > budget + 20:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                verify.finish(pid, fd)
+                del running[fd]
+                log(p.commit, 'verification killed; listing all candidates')
+                p.listed = set(p.candidates)
+                p.run = []
+    return [(p.commit, p.listed) for p in work]
+
+
+def absorb(selector, plan, result):
+    if 'failed' not in result:
+        log(plan.commit, 'verification error', result.get('error'))
+        plan.listed = set(plan.candidates)
+        return
+    number_of = {t['id']: t['number'] for t in selector.tests}
+    run = set(plan.run)
+    failed = set()
+    for item in result['failed']:
+        if isinstance(item, list):           # ['FILE', path] or ['ERR', ...]
+            if item[0] == 'FILE':
+                failed |= {n for n in run if selector.by_number[n]['file'] == item[1]}
+            else:
+                failed |= run
+        elif item in number_of and number_of[item] in run:
+            failed.add(number_of[item])
+        else:
+            failed |= run                    # unrecognised report: be safe
+    log(plan.commit, f'ran {len(run)} failed {len(failed)}')
+    plan.listed = set(plan.listed) | failed
