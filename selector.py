@@ -294,9 +294,45 @@ TWINS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq,
          (ast.Lt, ast.LtE), (ast.LtE, ast.Lt), (ast.Gt, ast.GtE), (ast.GtE, ast.Gt)}
 
 
+def walk_scoped(tree):
+    """Yield (node, runs_inside_a_function_call). Decorators, defaults and annotations are
+    evaluated where the function is defined; only bodies run when it is called."""
+    stack = [(tree, False)]
+    while stack:
+        node, inside = stack.pop()
+        yield node, inside
+        if isinstance(node, FUNCS + (ast.Lambda,)):
+            outer = list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]
+            if not isinstance(node, ast.Lambda):
+                outer += list(node.decorator_list)
+                outer += [a.annotation for a in node.args.args + node.args.kwonlyargs + node.args.posonlyargs
+                          if a.annotation is not None]
+                if node.returns is not None:
+                    outer.append(node.returns)
+                body = node.body
+            else:
+                body = [node.body]
+            stack.extend((n, inside) for n in outer)
+            stack.extend((n, True) for n in body)
+        else:
+            stack.extend((n, inside) for n in ast.iter_child_nodes(node))
+
+
+def changed_top_level(old_tree, new_tree):
+    """Pairs of top-level statements whose (location-free) dumps differ, or None when the
+    module's top-level layout changed."""
+    if len(old_tree.body) != len(new_tree.body):
+        return None
+    return [(o, n) for o, n in zip(old_tree.body, new_tree.body) if ast.dump(o) != ast.dump(n)]
+
+
 def twin_swap_site(old_tree, new_tree):
     """(line, col) of the one single-operator comparison whose operator was swapped for its twin
     (is/==, is not/!=, </<=, >/>=) when that is the patch's only change to the module, else None."""
+    pairs = changed_top_level(old_tree, new_tree)
+    if not pairs or len(pairs) != 1:
+        return None
+    old_tree, new_tree = pairs[0]
     old_cmps = [n for n in ast.walk(old_tree) if isinstance(n, ast.Compare)]
     new_cmps = [n for n in ast.walk(new_tree) if isinstance(n, ast.Compare)]
     if len(old_cmps) != len(new_cmps):
@@ -526,31 +562,65 @@ class Selector:
                 out.add(rel)
         return out
 
+    def ref_forms(self, rel, home_path, names):
+        """How module `rel` can name globals `names` of module `home_path`:
+        (bare names bound to them, names the module object itself is bound to)."""
+        if rel == home_path:
+            return set(names), False
+        tree = self.tree(rel)
+        if tree is None:
+            return set(), False
+        mod = self.module_name(home_path)
+        parent, _, short = mod.rpartition('.')
+        package = self.module_name(rel).rpartition('.')[0] if not rel.endswith('__init__.py') \
+            else self.module_name(rel)
+        bare, aliases = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                source = node.module or ''
+                if node.level:
+                    base = package.split('.')
+                    base = base[:len(base) - (node.level - 1)] if node.level > 1 else base
+                    source = '.'.join(base + ([source] if source else []))
+                for a in node.names:
+                    if source == mod and (a.name in names or a.name == '*'):
+                        bare.add(a.asname or a.name) if a.name != '*' else bare.update(names)
+                    if source == parent and a.name == short:
+                        aliases.add(a.asname or a.name)
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name == mod:
+                        aliases.add(a.asname or a.name)
+        return bare, aliases
+
     def references(self, names, home_path, module_scope=False):
-        """Coverage of every function that references any of `names` (module globals: only in
-        the defining module and modules importing it)."""
+        """Coverage of every function that references any of `names`. For module globals
+        (module_scope) only references that resolve to `home_path`'s binding count."""
         out = set()
         found = False
-        allowed = self.importers_of(home_path) if module_scope else None
         for rel, text in self.all_sources().items():
-            if allowed is not None and rel not in allowed:
-                continue
             if not any(n in text for n in names):
                 continue
+            if module_scope:
+                bare, attrs = self.ref_forms(rel, home_path, names)
+                if not bare and not attrs:
+                    continue
+            else:
+                bare, attrs = set(names), None
             try:
                 st = self.structure(rel)
             except SyntaxError:
                 continue
+
+            def refers(node):
+                # attrs: None = any `.name` access counts; else only `<module alias>.name`
+                return any((isinstance(x, ast.Name) and x.id in bare) or
+                           (isinstance(x, ast.Attribute) and x.attr in names and
+                            (attrs is None or ast.unparse(x.value) in attrs))
+                           for x in ast.walk(node))
+
             for start, end, node, chain in st.nodes:
-                if not isinstance(node, FUNCS + (ast.Lambda,)):
-                    continue
-                hit = False
-                for sub in ast.walk(node):
-                    if (isinstance(sub, ast.Name) and sub.id in names) or \
-                            (isinstance(sub, ast.Attribute) and sub.attr in names):
-                        hit = True
-                        break
-                if hit:
+                if isinstance(node, FUNCS + (ast.Lambda,)) and refers(node):
                     found = True
                     out |= self.line_cover(rel, range(start, end + 1))
             # names used in class bodies (e.g. TRANSFORMS tables) -> users of that class
@@ -559,8 +629,7 @@ class Selector:
                     for stmt in node.body:
                         if isinstance(stmt, FUNCS + (ast.ClassDef,)):
                             continue
-                        if any((isinstance(s, ast.Name) and s.id in names) or
-                               (isinstance(s, ast.Attribute) and s.attr in names) for s in ast.walk(stmt)):
+                        if refers(stmt):
                             users = self.class_users(rel, qualname(chain, node))
                             found = True
                             out |= users if users is not None else self.file_cover(rel)
@@ -581,7 +650,7 @@ class Selector:
             reasons.append(('syntax-error', path))
             return self.import_dependents(path)
         selected = set(self.opens_for(path))
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if changed_top_level(old_tree, new_tree) == []:
             reasons.append(('ast-identical', path, len(selected)))
             return selected
         site = twin_swap_site(old_tree, new_tree)
@@ -662,6 +731,8 @@ class Selector:
                 if users is None:
                     users = self.file_cover(path)
                 readers = self.attribute_readers(names) if names and not is_test else None
+                if readers is not None and not readers:
+                    readers = None    # a new member nobody names can still be found by iteration
                 got = set(users) & readers if readers is not None else set(users)
                 reasons.append(('inserted-member', path, qual, sorted(names)[:3], len(got)))
                 out |= got
@@ -754,7 +825,12 @@ class Selector:
                 reasons.append(('import-same-bindings', path, line))
                 return set()
         refs, found = self.references(names, path, module_scope=True) if names else (set(), False)
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom)) and found:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # an import only binds names: what matters is who uses them (the import itself
+            # failing is caught by the verifier's import probe)
+            reasons.append(('module-import', path, line, sorted(names)[:5], len(refs)))
+            return refs
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and found:
             reasons.append(('module-names', path, line, sorted(names)[:5], len(refs)))
             return refs
         cover = self.file_cover(path) | refs
@@ -773,33 +849,34 @@ class Selector:
         for rel, text in self.all_sources().items():
             if not any(n in text for n in names):
                 continue
-            try:
-                st = self.structure(rel)
-            except SyntaxError:
+            tree = self.tree(rel)
+            if tree is None:
                 return None
             imported = set(self.import_lines.get(rel, ()))
-            for node in ast.walk(st.tree):
+            for node, in_function in walk_scoped(tree):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in names:
                     return None
-                hit = (isinstance(node, ast.Attribute) and node.attr in names) or \
-                      (isinstance(node, ast.Name) and node.id in names and rel.startswith('sqlglot/'))
-                if not hit:
-                    continue
-                span = range(node.lineno, node.end_lineno + 1)
-                found = st.innermost(node.lineno)
-                in_function = found is not None and any(
-                    isinstance(c, FUNCS + (ast.Lambda,)) for c in found[3] + (found[2],))
-                if isinstance(node, ast.Name):
-                    # the defining assignment itself, or a bare use in a class body
-                    if not in_function:
-                        if isinstance(node.ctx, ast.Store):
-                            continue
+                if isinstance(node, ast.Name) and node.id in names and rel.startswith('sqlglot/'):
+                    # the defining assignment itself, or a bare use while a class body runs
+                    if not in_function and not isinstance(node.ctx, ast.Store):
                         return None
                     continue          # a bare name inside a function is a local/global, not the attribute
+                if not (isinstance(node, ast.Attribute) and node.attr in names):
+                    continue
+                span = range(node.lineno, node.end_lineno + 1)
                 if not in_function or any(n in imported for n in span):
                     return None       # read while modules/classes are being built
                 out |= self.line_cover(rel, span)
         return out
+
+    def tree(self, rel):
+        trees = self.__dict__.setdefault('_trees', {})
+        if rel not in trees:
+            try:
+                trees[rel] = ast.parse(self.all_sources()[rel])
+            except (SyntaxError, KeyError):
+                trees[rel] = None
+        return trees[rel]
 
     def import_dependents(self, path):
         """Every test that would fail if module `path` could not be imported."""
