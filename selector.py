@@ -323,6 +323,54 @@ def bound_names(node):
     return names
 
 
+def scan_dynamic_patterns(texts):
+    """(prefix, suffix) of attribute names sqlglot reads by computed name: getattr/hasattr with
+    an f-string or concatenation, or a dir() scan of a class filtered by startswith/endswith.
+    ('', '') means any name."""
+    found = set()
+    for rel, text in texts.items():
+        if not rel.startswith('sqlglot/') or ('getattr' not in text and 'dir(' not in text):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, FUNCS):
+                continue
+            modules = {t.id for a in ast.walk(fn) if isinstance(a, ast.Assign)
+                       and isinstance(a.value, ast.Call) and 'import_module' in ast.unparse(a.value.func)
+                       for t in a.targets if isinstance(t, ast.Name)}
+            filters = set()
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and \
+                        c.func.attr in ('startswith', 'endswith') and c.args and \
+                        isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str):
+                    filters.add((c.args[0].value, '') if c.func.attr == 'startswith' else ('', c.args[0].value))
+            for c in ast.walk(fn):
+                if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)):
+                    continue
+                if c.func.id == 'dir' and c.args:
+                    if isinstance(c.args[0], ast.Name) and c.args[0].id in modules:
+                        continue          # module attributes, not class attributes
+                    suffixes = {f for f in filters if f[1]}
+                    found |= suffixes or filters or {('', '')}
+                elif c.func.id in ('getattr', 'hasattr') and len(c.args) >= 2:
+                    arg = c.args[1]
+                    if isinstance(arg, ast.JoinedStr) and arg.values:
+                        first, last = arg.values[0], arg.values[-1]
+                        prefix = first.value if isinstance(first, ast.Constant) else ''
+                        suffix = last.value if isinstance(last, ast.Constant) and last is not first else ''
+                        if prefix or suffix:
+                            found.add((prefix, suffix))
+                    elif isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
+                        prefix = arg.left.value if isinstance(arg.left, ast.Constant) else ''
+                        suffix = arg.right.value if isinstance(arg.right, ast.Constant) else ''
+                        if prefix or suffix:
+                            found.add((prefix, suffix))
+    return found
+
+
 # --------------------------------------------------------------------------- selection
 
 class Selector:
@@ -353,6 +401,8 @@ class Selector:
         self._file_cover = {}
         self._texts = None
         self._changed_imports = {}
+        self._dynamic = None
+        self._patched = {}
 
     # -- index access
     def tset(self, i):
@@ -739,54 +789,17 @@ class Selector:
         return out
 
     def dynamic_patterns(self):
-        """(prefix, suffix) of attribute names sqlglot reads by computed name: getattr/hasattr with
-        an f-string or concatenation, or a dir() scan of a class filtered by startswith/endswith.
-        ('', '') means any name."""
-        if getattr(self, '_dynamic', None) is not None:
-            return self._dynamic
-        found = set()
-        for rel, text in self.all_sources().items():
-            if not rel.startswith('sqlglot/') or ('getattr' not in text and 'dir(' not in text):
-                continue
-            try:
-                tree = self.structure(rel).tree
-            except SyntaxError:
-                continue
-            for fn in ast.walk(tree):
-                if not isinstance(fn, FUNCS):
-                    continue
-                modules = {t.id for a in ast.walk(fn) if isinstance(a, ast.Assign)
-                           and isinstance(a.value, ast.Call) and 'import_module' in ast.unparse(a.value.func)
-                           for t in a.targets if isinstance(t, ast.Name)}
-                filters = set()
-                for c in ast.walk(fn):
-                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and \
-                            c.func.attr in ('startswith', 'endswith') and c.args and \
-                            isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str):
-                        filters.add((c.args[0].value, '') if c.func.attr == 'startswith' else ('', c.args[0].value))
-                for c in ast.walk(fn):
-                    if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)):
-                        continue
-                    if c.func.id == 'dir' and c.args:
-                        if isinstance(c.args[0], ast.Name) and c.args[0].id in modules:
-                            continue          # module attributes, not class attributes
-                        suffixes = {f for f in filters if f[1]}
-                        found |= suffixes or filters or {('', '')}
-                    elif c.func.id in ('getattr', 'hasattr') and len(c.args) >= 2:
-                        arg = c.args[1]
-                        if isinstance(arg, ast.JoinedStr) and arg.values:
-                            first, last = arg.values[0], arg.values[-1]
-                            prefix = first.value if isinstance(first, ast.Constant) else ''
-                            suffix = last.value if isinstance(last, ast.Constant) and last is not first else ''
-                            if prefix or suffix:
-                                found.add((prefix, suffix))
-                        elif isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Add):
-                            prefix = arg.left.value if isinstance(arg.left, ast.Constant) else ''
-                            suffix = arg.right.value if isinstance(arg.right, ast.Constant) else ''
-                            if prefix or suffix:
-                                found.add((prefix, suffix))
-        self._dynamic = found
-        return found
+        """Computed-name attribute lookups: precomputed for the pinned tree, plus any in the
+        files this patch changes (a patch could add a new dispatch site)."""
+        if self._dynamic is None:
+            pinned = self.index.get('dynamic_patterns')
+            if pinned is None:
+                found = scan_dynamic_patterns(self.all_sources())
+            else:
+                found = {tuple(x) for x in pinned}
+            self._dynamic = found
+        extra = scan_dynamic_patterns(self._patched) if self._patched else set()
+        return self._dynamic | extra
 
     def test_importers(self, path):
         mod = self.module_name(path)
@@ -800,6 +813,7 @@ class Selector:
     def analyze(self, text):
         """Returns (selected test numbers | EVERYTHING, reasons, patched sources)."""
         reasons = []
+        self._patched = {}
         try:
             diffs = parse_diff(text)
         except (ValueError, IndexError) as exc:
@@ -849,6 +863,8 @@ class Selector:
                 reasons.append(('apply-failed', path, str(exc)))
                 return EVERYTHING, reasons, {}
             sources[path] = new
+            if path.endswith('.py'):
+                self._patched[path] = new
             if new == old:
                 continue
             if path.endswith('.py') and path.startswith(('sqlglot/', 'tests/')):

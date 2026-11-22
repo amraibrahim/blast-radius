@@ -1,50 +1,81 @@
-"""Boundary checks for patch parsing and conservative selection."""
-import difflib
+"""Unit checks for diff handling, scheduling and sample-set safety. Run: python test_selector.py"""
+import gzip
+import json
+import os
 import unittest
-from selector import Selector, schedule
 
-class SelectionTests(unittest.TestCase):
-    def setUp(self):
-        self.source = 'def f():\n    return 1\n\ndef g():\n    return 2\n'
-        self.tests = [{'number': 0, 'id': 'tests/test_x.py::test_f', 'file': 'tests/test_x.py', 'seconds': 1.0},
-                      {'number': 1, 'id': 'tests/test_x.py::test_g', 'file': 'tests/test_x.py', 'seconds': 1.0}]
-        self.selector = Selector(self.tests, {'files': {'sqlglot/x.py': {'source': self.source,
-            'lines': {'2': [self.tests[0]['id']], '5': [self.tests[1]['id']]}}},
-            'fixtures': {'tests/fixtures/x.sql': [self.tests[0]['id']]}})
+HERE = os.path.dirname(os.path.abspath(__file__))
+import sys
+sys.modules['verify_driver'] = None
+import selector as S  # noqa: E402
 
-    def patch(self, updated):
-        return 'diff --git a/sqlglot/x.py b/sqlglot/x.py\n' + ''.join(difflib.unified_diff(
-            self.source.splitlines(True), updated.splitlines(True), fromfile='a/sqlglot/x.py', tofile='b/sqlglot/x.py'))
+ROOT = os.environ.get('BR_SQLGLOT', os.path.join(HERE, '.build/sqlglot'))
 
-    def test_body(self):
-        self.assertEqual(self.selector.select(self.patch(self.source.replace('return 1', 'return 3'))), {0})
 
-    def test_comment(self):
-        self.assertEqual(self.selector.select(self.patch(self.source.replace('    return 1', '    # comment\n    return 1'))), set())
+class DiffTests(unittest.TestCase):
+    def test_replacement_is_not_an_insertion(self):
+        old = 'a\nb\nc\n'
+        diff = S.parse_diff('diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n')
+        new, deleted, inserts, _, added = S.apply_hunks(old, diff[0].hunks)
+        self.assertEqual(new, 'a\nB\nc\n')
+        self.assertEqual(deleted, {2})
+        self.assertEqual(inserts, {})
+        self.assertEqual(added, {2})
 
-    def test_invalid_python(self):
-        self.assertEqual(self.selector.select(self.patch(self.source.replace('return 1', 'return ('))), {0, 1})
+    def test_pure_insertion(self):
+        old = 'a\nb\n'
+        diff = S.parse_diff('diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,3 @@\n a\n+# c\n b\n')
+        new, deleted, inserts, _, added = S.apply_hunks(old, diff[0].hunks)
+        self.assertEqual(new, 'a\n# c\nb\n')
+        self.assertEqual(inserts, {1: [2]})
 
-    def test_mismatch(self):
-        self.assertEqual(self.selector.select(self.patch(self.source.replace('return 1', 'return 3')).replace('-    return 1', '-    return 9')), {0, 1})
+    def test_mismatch_raises(self):
+        diff = S.parse_diff('diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-z\n+y\n')
+        with self.assertRaises(ValueError):
+            S.apply_hunks('a\n', diff[0].hunks)
 
+    def test_new_and_deleted_files(self):
+        d = S.parse_diff('diff --git a/n.py b/n.py\nnew file mode 100644\n--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+x = 1\n')
+        self.assertTrue(d[0].new_file)
+        d = S.parse_diff('diff --git a/n.py b/n.py\ndeleted file mode 100644\n')
+        self.assertTrue(d[0].deleted)
+
+    def test_garbage(self):
+        with self.assertRaises(ValueError):
+            S.parse_diff('not a diff')
+
+
+class ScheduleTests(unittest.TestCase):
     def test_empty(self):
-        self.assertEqual(self.selector.select(''), set())
+        self.assertEqual(S.schedule([], {}), ([], 0))
 
-    def test_unknown_format(self):
-        self.assertEqual(self.selector.select('unexpected patch'), {0, 1})
+    def test_picks_worker_count(self):
+        ms = {0: 10000, 1: 10000, 2: 10000, 3: 10}
+        workers, cost = S.schedule([0, 1, 2, 3], ms)
+        self.assertEqual(cost, 10010 + 2000 * 3)
+        self.assertEqual(sorted(n for w in workers for n in w), [0, 1, 2, 3])
 
-    def test_fixture(self):
-        self.assertEqual(self.selector.select('diff --git a/tests/fixtures/x.sql b/tests/fixtures/x.sql\n'), {0})
-
-    def test_rename(self):
-        self.assertEqual(self.selector.select('diff --git a/sqlglot/x.py b/sqlglot/y.py\nrename from sqlglot/x.py\nrename to sqlglot/y.py\n'), {0, 1})
-
-    def test_schedule(self):
-        self.assertEqual(schedule([]), [])
-        workers = schedule(self.tests)
+    def test_tiny_set_one_worker(self):
+        workers, cost = S.schedule([0, 1], {0: 5, 1: 7})
         self.assertEqual(len(workers), 1)
-        self.assertEqual(set(workers[0]), {0, 1})
+        self.assertEqual(cost, 2012)
+
+
+@unittest.skipUnless(os.path.isdir(ROOT), 'pinned checkout not available')
+class SampleSafetyTests(unittest.TestCase):
+    """Static candidates must contain every failing sample test (the verifier only removes)."""
+
+    def test_no_static_misses(self):
+        tests = json.load(open(os.path.join(HERE, 'sample/tests.json')))['tests']
+        index = json.load(gzip.open(os.path.join(HERE, 'index.json.gz'), 'rt'))
+        answers = json.load(open(os.path.join(HERE, 'sample/answers.json')))['commits']
+        sel = S.Selector(tests, index, ROOT)
+        for commit, info in answers.items():
+            text = open(os.path.join(HERE, 'sample/commits', commit + '.patch')).read()
+            cand, _, _ = sel.analyze(text)
+            if cand != S.EVERYTHING:
+                self.assertTrue(set(info['failing']) <= cand, commit)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -74,6 +74,19 @@ index = {'commit': 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa', 'tests': tests, '
          'classes': classes}
 if core:
     index['core_modules'] = core
+root = os.environ.get('SQLGLOT_ROOT')
+if root:
+    # computed-name attribute lookups in the pinned tree (see selector.scan_dynamic_patterns)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.modules['verify_driver'] = None
+    import selector
+    texts = {}
+    for dirpath, _, names in os.walk(os.path.join(root, 'sqlglot')):
+        for name in names:
+            if name.endswith('.py'):
+                full = os.path.join(dirpath, name)
+                texts[os.path.relpath(full, root)] = open(full, encoding='utf-8').read()
+    index['dynamic_patterns'] = sorted(selector.scan_dynamic_patterns(texts))
 if cpu:
     # local CPU (ms) of each test run inline the way verify.py runs it; class fixtures and imports
     index['cpu_ms'] = {t: round(v * 1000, 1) for t, v in cpu['test_cpu'].items()}
