@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)
 ROOT = os.path.join(HERE, '.build/sqlglot')
 EXPENSIVE_S = 2.0
 
+EQUIV_SWAP = {ast.Is: ast.Eq, ast.Eq: ast.Is, ast.IsNot: ast.NotEq, ast.NotEq: ast.IsNot}
 CMP_SWAP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE,
             ast.GtE: ast.Gt, ast.Is: ast.IsNot, ast.IsNot: ast.Is, ast.In: ast.NotIn, ast.NotIn: ast.In}
 
@@ -31,6 +32,8 @@ def mutations(node):
         for i, op in enumerate(node.ops):
             if type(op) in CMP_SWAP:
                 yield 'cmp', lambda n=node, i=i: n.ops.__setitem__(i, CMP_SWAP[type(n.ops[i])]())
+            if type(op) in EQUIV_SWAP and isinstance(node.comparators[i], (ast.Constant, ast.Attribute)):
+                yield 'is-eq', lambda n=node, i=i: n.ops.__setitem__(i, EQUIV_SWAP[type(n.ops[i])]())
     if isinstance(node, ast.BoolOp):
         yield 'boolop', lambda n=node: setattr(n, 'op', ast.Or() if isinstance(n.op, ast.And) else ast.And())
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -143,7 +146,7 @@ def job(args):
     if cheap_failed is None:
         return {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'skip': 'error'}
     rec = {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'n_cand': len(cand),
-           'cheap_failed': len(cheap_failed)}
+           'n_cheap': len(cheap), 'cheap_failed': len(cheap_failed)}
     if not cheap_failed:
         exp_failed = _run(sel, verify, sources, [target])
         rec['target_failed'] = None if exp_failed is None else bool(exp_failed)
@@ -159,7 +162,10 @@ def main():
     number_of = {t['id']: t['number'] for t in tests}
     idx = [number_of.get(t) for t in index['tests']]
     targets = [t['number'] for t in tests if t['seconds'] >= EXPENSIVE_S]
-    rng = random.Random(1234)
+    only = os.environ.get('TARGETS')
+    if only:
+        targets = [n for n in targets if any(k in tests[n]['id'] for k in only.split(','))]
+    rng = random.Random(int(os.environ.get('SEED', '1234')))
     jobs = []
     for target in targets:
         lines = []

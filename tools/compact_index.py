@@ -74,6 +74,22 @@ index = {'commit': 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa', 'tests': tests, '
          'classes': classes}
 if core:
     index['core_modules'] = core
+dominance_files = [f for f in os.environ.get('DOMINANCE', '').split(',') if f]
+if dominance_files:
+    # Synthetic mutants of the pinned repo (tools/mutants.py): for each expensive test, how often
+    # its cheaper co-candidates all passed (n) and it still failed (a).
+    tests_json = json.load(open(os.environ['TESTS_JSON']))['tests']
+    id_of = {t['number']: t['id'] for t in tests_json}
+    dom = defaultdict(lambda: [0, 0])
+    for path in dominance_files:
+        for r in json.load(open(path)):
+            if 'skip' in r or r.get('cheap_failed') or r.get('target_failed') is None:
+                continue
+            if r.get('n_cheap', 1) < 1:
+                continue
+            dom[id_of[r['target']]][0] += 1
+            dom[id_of[r['target']]][1] += int(bool(r['target_failed']))
+    index['dominance'] = dict(dom)
 root = os.environ.get('SQLGLOT_ROOT')
 if root:
     # computed-name attribute lookups in the pinned tree (see selector.scan_dynamic_patterns)

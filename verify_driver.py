@@ -24,6 +24,9 @@ CLEAN_CHILD_MS = 320.0   # local ms for a child that must import sqlglot itself 
 WARM_CHILD_MS = 40.0     # local ms for a child forked from a parent with sqlglot imported
 MIN_SAVING_MS = 400.0    # expected saving required before running anything (model error margin)
 P_FAIL = 0.5             # prior that the run set contains a failing test
+EXPENSIVE_S = 2.0        # tests at least this long are listed, never run (as in tools/mutants.py)
+MIN_EVIDENCE = 20        # calibration cases needed before an expensive test may be dropped
+MISS_MS = 300000.0
 PARALLEL = 2             # the run has 2 cores
 WALL_PER_COMMIT = 3.5    # seconds of wall budget per commit for verification
 WALL_CAP = 150.0
@@ -39,6 +42,7 @@ class Plan:
         self.est_ms = 0.0
         self.saving = 0.0
         self.probe = False
+        self.conditional = set()   # dropped unless something in the run set fails
 
 
 def is_clean(selector, index, sources):
@@ -62,6 +66,11 @@ def estimate(selector, index, numbers, clean=True):
     total += sum(cls_cpu.get(c, 0.0) for c in classes)
     total += sum(imp.get(f, 5.0) for f in files)
     return total * CPU_FACTOR
+
+
+def margin(selector, index, run, clean):
+    """Required expected saving: a fixed amount plus a share of the CPU being bet."""
+    return MIN_SAVING_MS + 0.2 * estimate(selector, index, run, clean)
 
 
 def failure_prior(reasons):
@@ -100,12 +109,41 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
         listed_cost = schedule(listed, ms)[1] if listed else 0.0
         extra = WORKER_MS_FAIL if not listed else 1000.0
         cost = estimate(selector, index, run, clean) + listed_cost + p_fail * extra
-        if cost < best[0] and cost + MIN_SAVING_MS < static:
+        if cost < best[0] and cost + margin(selector, index, run, clean) < static:
             best = (cost, (set(listed), run))
+    # Conditional drop: an expensive candidate whose failures were, on synthetic mutants of the
+    # pinned repo, always accompanied by a failure among its cheaper co-candidates is left out
+    # when those cheaper candidates all pass here. Any cheap failure brings it back.
+    expensive = {n for n in candidates if selector.by_number[n]['seconds'] >= EXPENSIVE_S}
+    cheap = sorted(set(candidates) - expensive)
+    dominance = index.get('dominance', {})
+    if expensive and cheap:
+        keep = set(expensive)
+        risk = 0.0
+        for n in sorted(expensive, key=lambda n: -ms[n]):
+            stats = dominance.get(selector.by_number[n]['id'])
+            if not stats or stats[0] < MIN_EVIDENCE:
+                continue
+            p_alone = (stats[1] + 0.5) / (stats[0] + 1.0)
+            gain = schedule(keep, ms)[1] - schedule(keep - {n}, ms)[1]
+            if MISS_MS * p_alone < gain:
+                keep.discard(n)
+                risk += MISS_MS * p_alone
+        dropped = expensive - keep
+        if dropped:
+            kept_cost = schedule(keep, ms)[1] if keep else 0.0
+            cost = (estimate(selector, index, cheap, clean)
+                    + p_fail * (schedule(expensive, ms)[1] + 1000.0)
+                    + (1 - p_fail) * (kept_cost + risk))
+            if cost < best[0] and cost + margin(selector, index, cheap, clean) < static:
+                best = (cost, (keep, cheap))
+                plan.conditional = dropped
     if best[1] is not None:
         plan.listed, plan.run = best[1]
         plan.est_ms = estimate(selector, index, plan.run, clean)
         plan.saving = static - best[0]
+    else:
+        plan.conditional = set()
     return plan
 
 
@@ -218,5 +256,7 @@ def absorb(selector, plan, result):
             failed.add(number_of[item])
         else:
             failed |= run                    # unrecognised report: be safe
+    if failed and plan.conditional:
+        failed |= plan.conditional           # a cheap failure: the dropped expensive tests come back
     log(plan.commit, f'ran {len(run)} failed {len(failed)} est {plan.est_ms/CPU_FACTOR:.0f}ms local, actual {result.get("cpu", 0)*1000:.0f}ms, saving {plan.saving/1000:.2f}s')
     plan.listed = set(plan.listed) | failed
