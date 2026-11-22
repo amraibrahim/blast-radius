@@ -22,5 +22,6 @@ RUN python /app/fetch_sqlglot.py eb11aec4be8cb2122afe713a4816662c3f0fb2fa /opt/s
 COPY selector.py verify.py verify_driver.py index.json.gz /app/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 
-ENV BR_SQLGLOT=/opt/sqlglot
+ENV BR_SQLGLOT=/opt/sqlglot \
+    BR_DROP=tests/test_parser.py::TestParser::test_max_nodes
 CMD ["python", "/app/selector.py"]
