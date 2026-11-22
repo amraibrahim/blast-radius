@@ -74,6 +74,10 @@ index = {'commit': 'eb11aec4be8cb2122afe713a4816662c3f0fb2fa', 'tests': tests, '
          'classes': classes}
 if core:
     index['core_modules'] = core
+cmp_profile = os.environ.get('CMP_PROFILE')
+if cmp_profile:
+    # comparison sites whose operator twins never disagreed in the pinned suite (build_cmp_profile)
+    index['equivalent_sites'] = json.load(open(cmp_profile))['equivalent']
 dominance_files = [f for f in os.environ.get('DOMINANCE', '').split(',') if f]
 if dominance_files:
     # Synthetic mutants of the pinned repo (tools/mutants.py): for each expensive test, how often

@@ -290,6 +290,31 @@ def qualname(chain, node=None):
     return '.'.join(parts)
 
 
+TWINS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot),
+         (ast.Lt, ast.LtE), (ast.LtE, ast.Lt), (ast.Gt, ast.GtE), (ast.GtE, ast.Gt)}
+
+
+def twin_swap_site(old_tree, new_tree):
+    """(line, col) of the one single-operator comparison whose operator was swapped for its twin
+    (is/==, is not/!=, </<=, >/>=) when that is the patch's only change to the module, else None."""
+    old_cmps = [n for n in ast.walk(old_tree) if isinstance(n, ast.Compare)]
+    new_cmps = [n for n in ast.walk(new_tree) if isinstance(n, ast.Compare)]
+    if len(old_cmps) != len(new_cmps):
+        return None
+    changed = [(o, n) for o, n in zip(old_cmps, new_cmps)
+               if [type(x) for x in o.ops] != [type(x) for x in n.ops]]
+    if len(changed) != 1:
+        return None
+    o, n = changed[0]
+    if len(o.ops) != 1 or len(n.ops) != 1 or (type(o.ops[0]), type(n.ops[0])) not in TWINS:
+        return None
+    saved = n.ops
+    n.ops = [type(o.ops[0])()]
+    same = ast.dump(old_tree) == ast.dump(new_tree)
+    n.ops = saved
+    return (o.lineno, o.col_offset) if same else None
+
+
 def import_bindings(tree):
     """{(bound name, source module, source name, level)} for module-level imports."""
     out = set()
@@ -402,6 +427,7 @@ class Selector:
         self._texts = None
         self._changed_imports = {}
         self._dynamic = None
+        self.equivalent_sites = set(index.get('equivalent_sites', ()))
         self._patched = {}
 
     # -- index access
@@ -557,6 +583,12 @@ class Selector:
         selected = set(self.opens_for(path))
         if ast.dump(old_tree) == ast.dump(new_tree):
             reasons.append(('ast-identical', path, len(selected)))
+            return selected
+        site = twin_swap_site(old_tree, new_tree)
+        if site is not None and f'{path}:{site[0]}:{site[1]}' in self.equivalent_sites:
+            # The comparison and its twin agreed on every value the whole suite fed it, so every
+            # test runs exactly as before.
+            reasons.append(('equivalent-swap', path, site[0], len(selected)))
             return selected
         self._changed_imports[path] = import_bindings(old_tree) ^ import_bindings(new_tree)
         self._changed_imports[path] = {b[0] for b in self._changed_imports[path]}
