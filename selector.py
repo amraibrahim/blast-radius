@@ -458,9 +458,7 @@ def twin_swap_site(pairs):
 
 
 def copy_flag_only(pairs):
-    """Whether the patch only changes `copy=False` to `copy=True` on exp.alias_.
-    This is a copy/alias identity change that leaves the expression shape and values intact.
-    """
+    """Whether the patch only changes `copy=False` to `copy=True` on exp.alias_."""
     if not pairs or len(pairs) != 1:
         return None
     old_tree, new_tree = pairs[0]
@@ -809,8 +807,6 @@ class Selector:
             return selected
         copy_site = copy_flag_only(pairs)
         if copy_site is not None:
-            # Changing an explicit copy=False to copy=True keeps the expression shape and values
-            # while avoiding mutation of the aliased expression.  No test needs to observe identity.
             reasons.append(('equivalent-copy', path, copy_site[0], len(selected)))
             return selected
         self._changed_imports[path] = import_bindings(old_tree) ^ import_bindings(new_tree)

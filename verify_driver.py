@@ -95,6 +95,8 @@ def plan_commit(selector, index, commit, candidates, sources, reasons=()):
     clean = is_clean(selector, index, sources)
     if not candidates or len(candidates) >= len(selector.all) * 0.5:
         return plan                      # nothing to run, or so broad that listing is cheaper
+    if len(candidates) <= 2:
+        return plan                      # one or two candidates cost less CPU to list than to verify
     ms = selector.ms
     static = schedule(candidates, ms)[1]
     cpu = index.get('cpu_ms', {})
