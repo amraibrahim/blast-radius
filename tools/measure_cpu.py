@@ -1,7 +1,7 @@
 """Build-time: measure each test's CPU cost when run the way verify.py runs it (unittest, inline
 pools), plus each class's setUpClass/tearDownClass cost. Pinned checkout only.
 
-usage: python tools/measure_cpu.py SQLGLOT_CHECKOUT TESTS_JSON OUT.json
+usage: [EMPTY_FIXTURES=1] python tools/measure_cpu.py SQLGLOT_CHECKOUT TESTS_JSON OUT.json
 """
 import importlib
 import json
@@ -20,6 +20,11 @@ sys.path.insert(0, root)
 os.environ['SKIP_INTEGRATION'] = '0'
 import concurrent.futures as cf  # noqa: E402
 cf.ProcessPoolExecutor = verify._InlineExecutor
+if os.environ.get('EMPTY_FIXTURES'):
+    # baseline for fixture-only commits: the .sql fixture helpers yield no records
+    import tests.helpers as _helpers
+    _helpers.load_sql_fixtures = lambda filename: iter(())
+    _helpers.load_sql_fixture_pairs = lambda filename: iter(())
 
 tests = json.load(open(tests_json))['tests']
 by_class = {}

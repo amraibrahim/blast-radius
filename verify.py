@@ -132,7 +132,7 @@ class _Result(unittest.TestResult):
         self._mark(test)
 
 
-def _child(root, sources, test_ids, timeouts, extra_files):
+def _child(root, sources, test_ids, timeouts, extra_files, fixture_records=False):
     """Executed in the forked child. Returns a JSON-able dict."""
     os.chdir(root)
     if root not in sys.path:
@@ -174,6 +174,8 @@ def _child(root, sources, test_ids, timeouts, extra_files):
         real_gzip_open = gzip.open
         gzip.open = lambda file, *a, **k: real_gzip_open(_map(file), *a, **k)
 
+    if fixture_records and redirect:
+        _restrict_fixture_loaders(redirect)
     finder = _Finder(root, sources)
     stale = [m for m in finder.by_module if m in sys.modules]
     if stale:
@@ -270,7 +272,46 @@ def preload():
             pass
 
 
-def start(root, sources, test_ids, timeouts, extra_files=None):
+def _restrict_fixture_loaders(redirect):
+    """Fixture-only commits: the code is the pinned code, so every fixture record the edit left
+    unchanged behaves exactly as in the pinned (passing) run. The test helpers that read .sql
+    fixtures therefore yield only the records that differ from the pinned file (a multiset
+    difference; both versions are read by the helper itself). Tests that read a fixture any other
+    way see the whole patched file, as before."""
+    import json as _json
+    from collections import Counter
+    import tests.helpers as helpers
+    fixtures_dir = os.path.abspath(helpers.FIXTURES_DIR)
+    keys = {os.path.abspath(k): k for k in redirect}
+
+    def wrap(real):
+        def loader(filename):
+            full = os.path.abspath(os.path.join(fixtures_dir, filename))
+            if full not in keys:
+                yield from real(filename)
+                return
+            new = list(real(filename))            # the patched text (open is redirected)
+            target = redirect.pop(keys[full])
+            try:
+                old = list(real(filename))        # the pinned file on disk
+            finally:
+                redirect[keys[full]] = target
+            seen = Counter(_json.dumps(r, sort_keys=True, default=str) for r in old)
+            for rec in new:
+                k = _json.dumps(rec, sort_keys=True, default=str)
+                if seen[k] > 0:
+                    seen[k] -= 1
+                else:
+                    yield rec
+
+        loader.__name__ = real.__name__
+        return loader
+
+    helpers.load_sql_fixtures = wrap(helpers.load_sql_fixtures)
+    helpers.load_sql_fixture_pairs = wrap(helpers.load_sql_fixture_pairs)
+
+
+def start(root, sources, test_ids, timeouts, extra_files=None, fixture_records=False):
     """Fork a child that runs the tests; returns (pid, read_fd)."""
     read_fd, write_fd = os.pipe()
     pid = os.fork()
@@ -281,7 +322,7 @@ def start(root, sources, test_ids, timeouts, extra_files=None):
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
             os.dup2(devnull, 2)
-            payload = json.dumps({'failed': _child(root, sources, test_ids, timeouts, extra_files)})
+            payload = json.dumps({'failed': _child(root, sources, test_ids, timeouts, extra_files, fixture_records)})
         except BaseException as exc:  # noqa: BLE001
             payload = json.dumps({'error': repr(exc)})
             code = 1

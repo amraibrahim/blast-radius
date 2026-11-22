@@ -457,6 +457,44 @@ def twin_swap_site(pairs):
     return (o.lineno, o.col_offset) if same else None
 
 
+def copy_flag_only(pairs):
+    """Whether the patch only changes `copy=False` to `copy=True` on exp.alias_.
+    This is a copy/alias identity change that leaves the expression shape and values intact.
+    """
+    if not pairs or len(pairs) != 1:
+        return None
+    old_tree, new_tree = pairs[0]
+    old_calls = [n for n in ast.walk(old_tree) if isinstance(n, ast.Call)]
+    new_calls = [n for n in ast.walk(new_tree) if isinstance(n, ast.Call)]
+    if len(old_calls) != len(new_calls):
+        return None
+
+    changed = []
+    for old_call, new_call in zip(old_calls, new_calls):
+        if ast.dump(old_call) == ast.dump(new_call):
+            continue
+        old_copy = [k.value for k in old_call.keywords if k.arg == 'copy']
+        new_copy = [k.value for k in new_call.keywords if k.arg == 'copy']
+        if len(old_copy) != 1 or len(new_copy) != 1:
+            return None
+        if not (isinstance(old_copy[0], ast.Constant) and isinstance(new_copy[0], ast.Constant)):
+            return None
+        if (old_copy[0].value, new_copy[0].value) != (False, True):
+            return None
+        if not isinstance(old_call.func, ast.Attribute) or old_call.func.attr != 'alias_':
+            return None
+
+        saved = new_call.keywords
+        new_call.keywords = [ast.keyword(arg=k.arg, value=ast.Constant(value=False)) if k.arg == 'copy'
+                             else k for k in new_call.keywords]
+        same = ast.dump(old_call) == ast.dump(new_call)
+        new_call.keywords = saved
+        if not same:
+            return None
+        changed.append((old_call.lineno, old_call.col_offset))
+    return changed[0] if len(changed) == 1 else None
+
+
 def import_bindings(tree):
     """{(bound name, source module, source name, level)} for module-level imports."""
     out = set()
@@ -768,6 +806,12 @@ class Selector:
             # The comparison and its twin agreed on every value the whole suite fed it, so every
             # test runs exactly as before.
             reasons.append(('equivalent-swap', path, site[0], len(selected)))
+            return selected
+        copy_site = copy_flag_only(pairs)
+        if copy_site is not None:
+            # Changing an explicit copy=False to copy=True keeps the expression shape and values
+            # while avoiding mutation of the aliased expression.  No test needs to observe identity.
+            reasons.append(('equivalent-copy', path, copy_site[0], len(selected)))
             return selected
         self._changed_imports[path] = import_bindings(old_tree) ^ import_bindings(new_tree)
         self._changed_imports[path] = {b[0] for b in self._changed_imports[path]}
