@@ -16,9 +16,11 @@
   <img src="https://img.shields.io/badge/Docker-1c2230?style=for-the-badge&amp;logo=docker&amp;logoColor=e8794a" alt="Docker" />
 </p>
 
+> **Hackathon project.** Built over November 21–22, 2026 for the Blast Radius track of a hackathon, where submissions were scored on hidden sets of code changes. The code is shared here as it was submitted, along with the track's brief and scoring rules.
+
 ## The project
 
-Blast Radius is my entry for the Blast Radius track of a hackathon. Each submission receives a batch of unified diffs against a pinned commit of [sqlglot](https://github.com/tobymao/sqlglot), the SQL parser and transpiler, whose suite has 1,620 tests. For each diff, it has to say which tests to run and how to split them across up to 8 workers.
+Blast Radius started as my submission for the hackathon's Blast Radius track. Each submission receives a batch of unified diffs against a pinned commit of [sqlglot](https://github.com/tobymao/sqlglot), the SQL parser and transpiler, whose suite has 1,620 tests. For each diff, it has to say which tests to run and how to split them across up to 8 workers.
 
 A selection costs the runtime of its busiest worker plus 2 seconds per worker. Leaving out a test that fails costs 300 seconds, and the program's own CPU time is added to the score. The kit's starter runs every test on every commit. It never misses a failure, but it pays for the whole suite every time. The full brief is in [docs/challenge.md](docs/challenge.md), and the exact scoring rules are in [docs/scoring.md](docs/scoring.md).
 
@@ -49,6 +51,12 @@ That is about 17× cheaper than the starter, and 0.5 s above the best possible s
 5. **Pack the workers.** The final selection is scheduled onto 1 to 8 workers, using whichever worker count costs least.
 
 The maps come only from the pinned commit, never from the sample answers. The track's rules forbid looking up answers by patch.
+
+## The hackathon
+
+The track gave every team the same kit: a run-everything starter, a local scorer, and 30 sample commits with their failing tests labeled. Teams submitted a public repository and a commit hash. The organizers rebuilt each image and ran it 3 times on hidden practice and final sets of commits, with no network, 2 CPUs and a 3-minute limit. Only the scorer saw the hidden commits and the program's output on them, so all tuning was done on the sample set and on synthetic mutations of the pinned sqlglot commit.
+
+The selector went through six major versions during the event, from 1104 s down to 95 s on the sample set. [docs/development-record.md](docs/development-record.md) records what each version changed.
 
 ## Built with
 
