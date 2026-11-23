@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local scorer for the blast radius track. The rules are in SCORING.md.
+"""Local scorer for the blast radius track. The rules are in docs/scoring.md.
 
 Teams:    python3 score.py <data_dir> <answers.json> <output_file> [--cpu-seconds 1.5]
 Harness:  python3 score.py --batch < request.json
@@ -53,7 +53,7 @@ def _parse_json_line(line: str) -> Any:
 
 
 def _whole_number(value: Any) -> int | None:
-    # bool is a subclass of int in Python, and SCORING.md says `true` is not a number.
+    # bool is a subclass of int in Python, and docs/scoring.md says `true` is not a number.
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -236,7 +236,7 @@ def _run_report(arguments: list[str]) -> int:
     tests = json.loads((options.data_dir / "tests.json").read_text("utf-8"))["tests"]
     answers = json.loads(options.answers.read_text("utf-8"))["commits"]
 
-    # SCORING.md defines the known commits by the patch files, while score_run
+    # docs/scoring.md defines the known commits by the patch files, while score_run
     # takes them from the answers, so the report is only right when they agree.
     patch_commits = {
         patch_path.name.removesuffix(".patch")

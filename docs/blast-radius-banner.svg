@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title description">
+  <title id="title">Blast Radius</title>
+  <desc id="description">A dark slate notebook grid with cream lettering and an orange accent introducing Blast Radius, a test selector for sqlglot.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 H 0 V 40" fill="none" stroke="#f4efe6" stroke-opacity="0.08"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="440" rx="16" fill="#1c2230"/>
+  <rect width="1200" height="440" rx="16" fill="url(#grid)"/>
+  <circle cx="960" cy="200" r="40" fill="none" stroke="#e8794a" stroke-opacity="0.9" stroke-width="2"/>
+  <circle cx="960" cy="200" r="90" fill="none" stroke="#e8794a" stroke-opacity="0.45" stroke-width="2"/>
+  <circle cx="960" cy="200" r="140" fill="none" stroke="#e8794a" stroke-opacity="0.2" stroke-width="2"/>
+  <circle cx="960" cy="200" r="8" fill="#e8794a"/>
+  <rect x="64" y="54" width="16" height="16" fill="#e8794a"/>
+  <text x="96" y="68" fill="#f4efe6" font-family="monospace" font-size="16" letter-spacing="2">AMRA IBRAHIM / BLAST RADIUS</text>
+  <text x="64" y="185" fill="#f4efe6" font-family="Georgia, serif" font-size="76">Run fewer tests.</text>
+  <rect x="64" y="258" width="310" height="24" fill="#e8794a"/>
+  <text x="64" y="275" fill="#f4efe6" font-family="Georgia, serif" font-style="italic" font-size="48">Miss nothing.</text>
+  <text x="66" y="338" fill="#c9cdd6" font-family="Arial, sans-serif" font-size="20">Diff parsing · Coverage maps · Live verification · Worker packing</text>
+  <path d="M 64 372 H 1136" stroke="#f4efe6" stroke-opacity="0.2"/>
+  <text x="64" y="407" fill="#c9cdd6" font-family="monospace" font-size="13" letter-spacing="1">ONLY THE TESTS A CHANGE CAN BREAK. 0 MISSED FAILURES ON THE SAMPLE SET.</text>
+  <text x="1050" y="407" fill="#e8794a" font-family="monospace" font-size="13">01 /</text>
+</svg>

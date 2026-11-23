@@ -1,70 +1,105 @@
-# Blast Radius starter
+<h1 align="center">Blast Radius</h1>
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+<p align="center">Given a code change to sqlglot, pick the tests it can break and run only those.</p>
 
-## The problem
+<p align="center">
+  <a href="https://github.com/amraibrahim">GitHub</a> ·
+  <a href="https://www.linkedin.com/in/amraibrahimr/">LinkedIn</a> ·
+  <a href="mailto:ibrahimar2@vcu.edu">Get in touch</a>
+</p>
 
-Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
+![Blast Radius banner](docs/blast-radius-banner.svg)
 
-| | |
-| --- | --- |
-| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
-| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
-| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
+<p align="center">
+  <img src="https://img.shields.io/badge/Python_3.13-1c2230?style=for-the-badge&amp;logo=python&amp;logoColor=e8794a" alt="Python 3.13" />
+  <img src="https://img.shields.io/badge/pytest-1c2230?style=for-the-badge&amp;logo=pytest&amp;logoColor=f4efe6" alt="pytest" />
+  <img src="https://img.shields.io/badge/Docker-1c2230?style=for-the-badge&amp;logo=docker&amp;logoColor=e8794a" alt="Docker" />
+</p>
 
-Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
+## The project
 
-## Scoring
+Blast Radius is my entry for the Blast Radius track of a hackathon. Each submission receives a batch of unified diffs against a pinned commit of [sqlglot](https://github.com/tobymao/sqlglot), the SQL parser and transpiler, whose suite has 1,620 tests. For each diff, it has to say which tests to run and how to split them across up to 8 workers.
 
-Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
+A selection costs the runtime of its busiest worker plus 2 seconds per worker. Leaving out a test that fails costs 300 seconds, and the program's own CPU time is added to the score. The kit's starter runs every test on every commit. It never misses a failure, but it pays for the whole suite every time. The full brief is in [docs/challenge.md](docs/challenge.md), and the exact scoring rules are in [docs/scoring.md](docs/scoring.md).
 
-- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
-- A commit where you left out a test that fails adds 300 seconds.
-- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
-- Your image runs 3 times and the middle total counts.
+This selector reads each diff structurally and maps the changed code to the tests that actually reach it. It then runs the cheap candidates against the patched tree to confirm which ones fail.
 
-"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
+## Results
 
-## Try it
+On the 30-commit sample set, measured with `python benchmark.py`:
 
-You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
+| Approach | Simulated seconds | Missed failures |
+| --- | --- | --- |
+| Kit starter (run every test) | ~1614 | 0 |
+| **Blast Radius** | **94.9** | **0** |
+| Oracle (only the failing tests, best worker split) | 94.4 | 0 |
+
+That is about 17× cheaper than the starter, and 0.5 s above the best possible score. The selector's own CPU time is about 1.2 s locally. The version-by-version history is in [docs/development-record.md](docs/development-record.md).
+
+## How it works
+
+1. **Rebuild the change.** The selector parses the unified diff and applies it to the pinned checkout, in memory, to get the old and new version of every changed file.
+2. **Locate it structurally.** It compares the old and new ASTs to find exactly which functions, class bodies, table entries or imports changed. This way, a reformatted line or a moved definition does not select the whole file.
+3. **Map changes to tests.** Maps built at image-build time from the pinned commit's own test run turn each change into candidate tests:
+   - per-test line coverage, recorded with `sys.monitoring` (including `PY_START`, so one-line lambdas count)
+   - class instantiation, file reads and directory listings
+   - a class-table access profile: which keys of dialect tables like `TRANSFORMS` each test reads
+   - a comparison profile that proves some operator swaps cannot change any test's result
+4. **Verify the cheap candidates.** `verify_driver.py` estimates whether running a candidate now costs less than listing it. Cheap candidates run against the patched tree in warm forked children (`verify.py`), and only the ones that really fail are kept. Expensive candidates are listed without being run.
+5. **Pack the workers.** The final selection is scheduled onto 1 to 8 workers, using whichever worker count costs least.
+
+The maps come only from the pinned commit, never from the sample answers. The track's rules forbid looking up answers by patch.
+
+## Built with
+
+- Python 3.13 (`ast`, `sys.monitoring`, `os.fork`)
+- [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec`, with its pytest and unittest suite
+- Docker, matching the scorer's linux/amd64 image and resource limits
+
+## Run locally
+
+Use Python 3.13. Run these commands from the project folder.
+
+Fetch sqlglot at the pinned commit and install the labeled package set:
 
 ```sh
-make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
-make check    # the output's format only
+python3 tools/fetch_sqlglot.py eb11aec4be8cb2122afe713a4816662c3f0fb2fa .build/sqlglot
+python3 -m venv .build/venv
+.build/venv/bin/pip install -r requirements.lock
 ```
 
-`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
+Score the selector natively on the sample set and run the unit checks:
 
-`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+```sh
+PATH=$PWD/.build/venv/bin:$PATH .build/venv/bin/python benchmark.py
+.build/venv/bin/python test_selector.py
+```
 
-## Submit
+`benchmark.py --static` skips the live verification step, and `BR_VERBOSE=1` explains each selection on stderr.
 
-Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
+To run the image exactly as the scorer does (no network, 2 CPUs, 4 GB, read-only disk), you need Docker and make:
 
-## Rules
+```sh
+make sample   # build, run on the 30 sample commits, and score
+make check    # output format only
+```
 
-- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
-- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
-- Only the final counts. The practice board carries no prize.
+The committed `index.json.gz` is current. You only need to rebuild it if you change the tooling, and the steps for that are in [docs/development-record.md](docs/development-record.md).
 
-## How your image runs
+## Repository guide
 
-- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
-- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
-- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
-- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
-- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
-- stdout may hold 2 MB. More rejects the run.
+| Path | Purpose |
+| --- | --- |
+| [`selector.py`](selector.py) | Entry point: diff parsing, structural change detection, candidate selection, and worker packing |
+| [`verify_driver.py`](verify_driver.py) | Cost model that decides which candidates are worth running |
+| [`verify.py`](verify.py) | Runs candidate tests against the patched tree in forked children |
+| [`index.json.gz`](index.json.gz) | Coverage, instantiation, and profile maps built from the pinned commit |
+| [`tools`](tools) | Map builders (`build_*.py`, `compact_index.py`) and calibration and soundness checks |
+| [`benchmark.py`](benchmark.py) | Native sample score with per-commit excess over the oracle |
+| [`test_selector.py`](test_selector.py) | Unit checks for diff handling, scheduling, and sample safety |
+| [`score.py`](score.py), [`sample`](sample), [`Makefile`](Makefile) | The track kit's local scorer, sample commits, and run targets |
+| [`docs`](docs) | Track brief, scoring rules, and development record |
 
-## Things that will catch you
+## Connect
 
-- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
-- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
-- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
-- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
-- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
-- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
-- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
-- A change that only adds a comment is not promised to be harmless.
+[LinkedIn](https://www.linkedin.com/in/amraibrahimr/) · [GitHub](https://github.com/amraibrahim) · [Email](mailto:ibrahimar2@vcu.edu)
