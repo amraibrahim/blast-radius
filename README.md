@@ -56,7 +56,7 @@ The maps come only from the pinned commit, never from the sample answers. The tr
 
 The track gave every team the same kit: a run-everything starter, a local scorer, and 30 sample commits with their failing tests labeled. Teams submitted a public repository and a commit hash. The organizers rebuilt each image and ran it 3 times on hidden practice and final sets of commits, with no network, 2 CPUs and a 3-minute limit. Only the scorer saw the hidden commits and the program's output on them, so all tuning was done on the sample set and on synthetic mutations of the pinned sqlglot commit.
 
-The selector went through six major versions during the event, from 1104 s down to 95 s on the sample set. [docs/development-record.md](docs/development-record.md) records what each version changed.
+The selector went through six major versions during the event. On the sample set they went from 335 s for the first coverage-only version down to 95 s. [docs/development-record.md](docs/development-record.md) records what each version changed.
 
 ## Built with
 
